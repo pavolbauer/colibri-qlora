@@ -43,8 +43,9 @@ failure. The full design, memory model, and milestone gates are in
 | M1 — `colibri-lora-v1` adapter format + inference application | ✅ |
 | M2 — toy frozen-int4 linear + LoRA trainer, gradients vs PyTorch float64 | ✅ |
 | M3 — full-block training forward/backward on the tiny GLM oracle, gradients + AdamW trajectory vs PyTorch | ✅ |
-| M4 — activation-checkpointed backward (bounded memory) | 🚧 next |
-| M5–M9 — streamed-expert training, Metal kernels, real 64 GB run | ⏳ |
+| M4 — activation-checkpointed backward: recompute parity bitwise, stash O(1 layer) | ✅ |
+| M5 — streamed-expert backward/recompute | 🚧 next |
+| M6–M9 — Metal training kernels, real 64 GB run, overfit proof | ⏳ |
 
 **What exists so far**
 
@@ -56,9 +57,13 @@ failure. The full design, memory model, and milestone gates are in
   including the streaming quantized-transpose `dx = Q(W)ᵀ dy` (never
   materializes a dequantized matrix). Validated against PyTorch float64
   autograd in `make check` ([`c/tests/test_train_linear.c`](c/tests/test_train_linear.c)).
-- [`c/train/train_model.h`](c/train/train_model.h) — WIP: manual backward
-  through the full GLM block (RMSNorm, RoPE, MLA attention, SwiGLU, frozen
-  top-k routing with differentiable gate values).
+- [`c/train/train_model.h`](c/train/train_model.h) — manual backward through
+  the full GLM block (RMSNorm, RoPE, MLA attention, SwiGLU, frozen top-k
+  routing with differentiable gate values), gradient-validated against PyTorch
+  ([`c/tests/test_train_tiny.c`](c/tests/test_train_tiny.c)). Two memory modes:
+  full retention, or activation checkpointing (layer input + routing ids only,
+  one shared scratch stash, routing replayed on recompute — gradients bitwise
+  equal to the retained mode).
 - [`c/tools/make_lora_adapter.py`](c/tools/make_lora_adapter.py) /
   [`c/tools/make_train_oracle.py`](c/tools/make_train_oracle.py) — adapter
   generator and PyTorch training ground truth (losses, gradients, AdamW

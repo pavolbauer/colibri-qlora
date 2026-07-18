@@ -1,16 +1,27 @@
-/* Milestone 3: training forward + manual backward through the GLM transformer,
- * updating ONLY LoRA adapters on self_attn.o_proj (base + router frozen).
+/* Milestones 3+4: training forward + manual backward through the GLM
+ * transformer, updating ONLY LoRA adapters on self_attn.o_proj (base + router
+ * frozen), with optional activation checkpointing.
  *
- * Correctness-first implementation for the tiny oracle model: f32 dense QTs
- * (fmt=0, dbits=16), full activation retention (checkpointing is Milestone 4),
- * full causal attention (index_topk >> T so DSA selection is the identity, the
- * same property the inference oracle relies on), MTP absent.
+ * Two memory modes (tt_init ckpt flag):
+ *   ckpt=0  M3 semantics — every layer retains its full activation stash.
+ *   ckpt=1  M4 semantics — each layer retains ONLY its input x_in [T,D] and
+ *           its routing choices [T,K]; every other intermediate lives in ONE
+ *           scratch stash shared by all layers. Backward re-runs the layer
+ *           forward from the checkpoint (routing REPLAYED from the saved ids,
+ *           same kernels, same order -> bit-identical recompute) and then does
+ *           the layer backward. Stash memory is O(1 layer), not O(n_layers).
  *
- * Backward per AGENTS.md §8: dW is never allocated for any frozen tensor; every
- * frozen matmul contributes dx = W^T dy only (train_qt_bwd_dx). Routing top-k
- * is replayed as a frozen selection; gradients DO flow through the sigmoid gate
+ * Backward per AGENTS.md §8: dW is never allocated for any frozen tensor;
+ * every frozen matmul contributes dx = W^T dy only (train_qt_bwd_dx). Routing
+ * top-k is a frozen selection; gradients DO flow through the sigmoid gate
  * VALUES and their normalization (PyTorch autograd does the same: gather is
- * differentiable in the gathered values, not in the indices).
+ * differentiable in the gathered values, not the indices).
+ *
+ * Correctness-first scope for the tiny oracle model: f32 dense QTs (fmt=0,
+ * dbits=16), full causal attention (index_topk >> T so DSA selection is the
+ * identity — the property the inference oracle relies on), MTP absent.
+ * logits [T,V] stay retained in both modes (recomputing the head per position
+ * is an M5+ concern; documented, not hidden).
  *
  * Include after glm.c (needs Model/QT/matmul/rmsnorm) + train/qlora_ops.h. */
 #ifndef TRAIN_MODEL_H
@@ -75,9 +86,12 @@ static void tt_swiglu_bwd(const QT *gate, const QT *up, const QT *down,
     free(dh); free(dg); free(du);
 }
 
-/* ---------- per-layer activation stash (full retention, M3 scope) ---------- */
+/* ---------- per-layer activation stash ---------- */
 typedef struct {
+    /* CHECKPOINT fields — always private per layer */
     float *x_in;                 /* [T,D] residual entering the layer */
+    int   *eidx;                 /* [T,K] routing choices (sparse layers) */
+    /* RECOMPUTABLE fields — private (ckpt=0) or aliased to the shared scratch */
     float *nrm1;                 /* [T,D] */
     float *qa,*qan,*q;           /* [T,qlr] [T,qlr] [T,H*qh] (q roped) */
     float *kva;                  /* [T,kvl+R] raw kv_a output (pre-norm/pre-rope) */
@@ -89,31 +103,32 @@ typedef struct {
     float *x_mid;                /* [T,D] residual entering mlp */
     float *nrm2;                 /* [T,D] */
     float *g,*u;                 /* dense mlp or shared expert pre-activations [T,N] */
-    /* routed (sparse layers only) */
-    int   *eidx; float *ew,*ep;  /* [T,K] sel, [T,K] final weights, [T,K] sigmoid p */
+    float *ew,*ep;               /* [T,K] final weights, [T,K] sigmoid p */
     float *eg,*eu,*eout;         /* [T,K,mi] [T,K,mi] [T,K,D] */
 } TTLayer;
 
 typedef struct {
     Model *m; LoraAdapter *lora;
     int T,D,H,qh,vh,nope,kvl,R,E,K,mi;
+    int ckpt;                    /* 1 = M4 checkpointed mode */
     TTLayer *L;
-    QT (*ew)[3];                 /* routed expert weights f32: [layer*E+e][g,u,d] */
+    TTLayer scratch;             /* shared recompute stash (ckpt=1) */
+    QT (*expw)[3];               /* routed expert weights f32: [layer*E+e][g,u,d] */
     float *x;                    /* [T,D] residual stream (final state after fwd) */
     float *fn;                   /* [T,D] final rmsnorm out */
     float *logits;               /* [T,V] */
     float loss;
-    /* adapter grads, indexed like lora->t */
-    float **dA,**dB;
+    float **dA,**dB;             /* adapter grads, indexed like lora->t */
+    int64_t bytes_stash;         /* retained activation bytes (accounting) */
 } TT;
 
 static void tt_load_experts(TT *tt){
     Model *m=tt->m; Cfg *c=&m->c;
-    tt->ew=calloc((size_t)c->n_layers*tt->E,sizeof(*tt->ew));
+    tt->expw=calloc((size_t)c->n_layers*tt->E,sizeof(*tt->expw));
     for(int li=0;li<c->n_layers;li++){
         if(!m->L[li].sparse) continue;
         for(int e=0;e<tt->E;e++){
-            char nm[256]; QT *w=tt->ew[li*tt->E+e];
+            char nm[256]; QT *w=tt->expw[li*tt->E+e];
             static const char *suf[3]={"gate_proj","up_proj","down_proj"};
             int Os[3]={tt->mi,tt->mi,tt->D}, Is[3]={tt->D,tt->D,tt->mi};
             for(int k=0;k<3;k++){
@@ -125,32 +140,55 @@ static void tt_load_experts(TT *tt){
     }
 }
 
-static TT *tt_init(Model *m, LoraAdapter *lora, int T){
+/* allocate the recomputable fields of one stash; sized for the WORST layer so a
+ * single scratch serves them all. Returns bytes allocated. */
+static int64_t tt_alloc_recompute(TT *tt, TTLayer *s, int any_sparse, int any_lora){
+    Cfg *c=&tt->m->c;
+    int T=tt->T,D=tt->D,H=tt->H,qh=tt->qh,vh=tt->vh,kvl=tt->kvl,R=tt->R,K=tt->K,mi=tt->mi;
+    int N=c->dense_inter; if(any_sparse && mi*c->n_shared>N) N=mi*c->n_shared;
+    int64_t b=0;
+    #define AL(f,n) do{ s->f=falloc(n); b+=(int64_t)(n)*4; }while(0)
+    AL(nrm1,(int64_t)T*D); AL(qa,(int64_t)T*c->q_lora); AL(qan,(int64_t)T*c->q_lora);
+    AL(q,(int64_t)T*H*qh); AL(kva,(int64_t)T*(kvl+R)); AL(ckn,(int64_t)T*kvl);
+    AL(kr,(int64_t)T*R);   AL(kvb,(int64_t)T*H*(tt->nope+vh));
+    AL(probs,(int64_t)H*T*T); AL(ctx,(int64_t)T*H*vh);
+    AL(x_mid,(int64_t)T*D); AL(nrm2,(int64_t)T*D);
+    AL(g,(int64_t)T*N); AL(u,(int64_t)T*N);
+    if(any_sparse){
+        AL(ew,(int64_t)T*K); AL(ep,(int64_t)T*K);
+        AL(eg,(int64_t)T*K*mi); AL(eu,(int64_t)T*K*mi); AL(eout,(int64_t)T*K*D);
+    }
+    if(any_lora) AL(z,(int64_t)T*tt->lora->rank);
+    #undef AL
+    return b;
+}
+
+static TT *tt_init(Model *m, LoraAdapter *lora, int T, int ckpt){
     TT *tt=calloc(1,sizeof(TT));
     Cfg *c=&m->c;
     tt->m=m; tt->lora=lora; tt->T=T; tt->D=c->hidden; tt->H=c->n_heads;
     tt->qh=c->qk_head; tt->vh=c->v_head; tt->nope=c->qk_nope; tt->kvl=c->kv_lora;
     tt->R=c->qk_rope; tt->E=c->n_experts; tt->K=c->topk; tt->mi=c->moe_inter;
+    tt->ckpt=ckpt;
     tt->L=calloc(c->n_layers,sizeof(TTLayer));
-    int D=tt->D,H=tt->H,qh=tt->qh,vh=tt->vh,kvl=tt->kvl,R=tt->R,K=tt->K,mi=tt->mi;
+    int D=tt->D,K=tt->K;
+    int any_sparse=0; for(int li=0;li<c->n_layers;li++) any_sparse|=m->L[li].sparse;
+    if(ckpt) tt->bytes_stash+=tt_alloc_recompute(tt,&tt->scratch,any_sparse,lora->n>0);
     for(int li=0;li<c->n_layers;li++){
         TTLayer *s=&tt->L[li];
-        s->x_in=falloc((int64_t)T*D);   s->nrm1=falloc((int64_t)T*D);
-        s->qa=falloc((int64_t)T*c->q_lora); s->qan=falloc((int64_t)T*c->q_lora);
-        s->q=falloc((int64_t)T*H*qh);   s->kva=falloc((int64_t)T*(kvl+R));
-        s->ckn=falloc((int64_t)T*kvl);  s->kr=falloc((int64_t)T*R);
-        s->kvb=falloc((int64_t)T*H*(tt->nope+vh));
-        s->probs=falloc((int64_t)H*T*T); s->ctx=falloc((int64_t)T*H*vh);
-        s->x_mid=falloc((int64_t)T*D);  s->nrm2=falloc((int64_t)T*D);
-        int N=m->L[li].sparse ? mi*c->n_shared : c->dense_inter;
-        s->g=falloc((int64_t)T*N); s->u=falloc((int64_t)T*N);
-        if(m->L[li].sparse){
-            s->eidx=calloc((size_t)T*K,sizeof(int));
-            s->ew=falloc((int64_t)T*K); s->ep=falloc((int64_t)T*K);
-            s->eg=falloc((int64_t)T*K*mi); s->eu=falloc((int64_t)T*K*mi);
-            s->eout=falloc((int64_t)T*K*D);
+        s->x_in=falloc((int64_t)T*D); tt->bytes_stash+=(int64_t)T*D*4;
+        if(m->L[li].sparse){ s->eidx=calloc((size_t)T*K,sizeof(int)); tt->bytes_stash+=(int64_t)T*K*4; }
+        if(ckpt){
+            /* recomputable fields alias the shared scratch (x_in/eidx stay private) */
+            float *xi=s->x_in; int *ei=s->eidx;
+            *s=tt->scratch; s->x_in=xi; s->eidx=ei;
+            if(!lora_find(lora,li,LORA_T_O)) s->z=NULL;
+        } else {
+            tt->bytes_stash+=tt_alloc_recompute(tt,s,m->L[li].sparse,0);
+            if(m->L[li].sparse){ /* keep */ } else { s->ew=s->ep=s->eg=s->eu=s->eout=NULL; }
+            if(lora_find(lora,li,LORA_T_O)){ s->z=falloc((int64_t)T*lora->rank); tt->bytes_stash+=(int64_t)T*lora->rank*4; }
+            else s->z=NULL;
         }
-        if(lora_find(lora,li,LORA_T_O)) s->z=falloc((int64_t)T*lora->rank);
     }
     tt->x=falloc((int64_t)T*D); tt->fn=falloc((int64_t)T*D);
     tt->logits=falloc((int64_t)T*c->vocab);
@@ -163,95 +201,217 @@ static TT *tt_init(Model *m, LoraAdapter *lora, int T){
     return tt;
 }
 
-/* ---------- forward ---------- */
-static float tt_forward(TT *tt, const int *tok){
-    Model *m=tt->m; Cfg *c=&m->c;
+/* ---------- one layer forward from s->x_in ----------
+ * Fills the stash; if x_out != NULL also writes the layer output stream
+ * (x_in + attn + mlp) — x_out may alias the buffer x_in was copied from.
+ * replay=1 (checkpointed backward): routing choices are NOT re-selected, they
+ * are replayed from s->eidx; gate values are recomputed deterministically. */
+static void tt_layer_forward(TT *tt, int li, TTLayer *s, float *x_out, int replay){
+    Model *m=tt->m; Cfg *c=&m->c; Layer *l=&m->L[li];
     int T=tt->T,D=tt->D,H=tt->H,qh=tt->qh,vh=tt->vh,nope=tt->nope,kvl=tt->kvl,R=tt->R,K=tt->K,mi=tt->mi;
-    for(int t=0;t<T;t++) embed_row(m,tok[t],tt->x+(int64_t)t*D);
-    float *tmp=falloc(D);
-    for(int li=0;li<c->n_layers;li++){
-        Layer *l=&m->L[li]; TTLayer *s=&tt->L[li];
-        memcpy(s->x_in,tt->x,(int64_t)T*D*sizeof(float));
-        for(int t=0;t<T;t++) rmsnorm(s->nrm1+(int64_t)t*D,s->x_in+(int64_t)t*D,l->in_ln,D,c->eps);
-        /* projections */
-        for(int t=0;t<T;t++){
-            const float *n1=s->nrm1+(int64_t)t*D;
-            matmul_qt(s->qa+(int64_t)t*c->q_lora,n1,&l->q_a,1);
-            rmsnorm(s->qan+(int64_t)t*c->q_lora,s->qa+(int64_t)t*c->q_lora,l->q_a_ln,c->q_lora,c->eps);
-            matmul_qt(s->q+(int64_t)t*H*qh,s->qan+(int64_t)t*c->q_lora,&l->q_b,1);
-            for(int h=0;h<H;h++) rope_interleave(s->q+(int64_t)t*H*qh+(int64_t)h*qh+nope,t,c);
-            matmul_qt(s->kva+(int64_t)t*(kvl+R),n1,&l->kv_a,1);
-            rmsnorm(s->ckn+(int64_t)t*kvl,s->kva+(int64_t)t*(kvl+R),l->kv_a_ln,kvl,c->eps);
-            memcpy(s->kr+(int64_t)t*R,s->kva+(int64_t)t*(kvl+R)+kvl,R*sizeof(float));
-            rope_interleave(s->kr+(int64_t)t*R,t,c);
-            matmul_qt(s->kvb+(int64_t)t*H*(nope+vh),s->ckn+(int64_t)t*kvl,&l->kv_b,1);
+    for(int t=0;t<T;t++) rmsnorm(s->nrm1+(int64_t)t*D,s->x_in+(int64_t)t*D,l->in_ln,D,c->eps);
+    for(int t=0;t<T;t++){
+        const float *n1=s->nrm1+(int64_t)t*D;
+        matmul_qt(s->qa+(int64_t)t*c->q_lora,n1,&l->q_a,1);
+        rmsnorm(s->qan+(int64_t)t*c->q_lora,s->qa+(int64_t)t*c->q_lora,l->q_a_ln,c->q_lora,c->eps);
+        matmul_qt(s->q+(int64_t)t*H*qh,s->qan+(int64_t)t*c->q_lora,&l->q_b,1);
+        for(int h=0;h<H;h++) rope_interleave(s->q+(int64_t)t*H*qh+(int64_t)h*qh+nope,t,c);
+        matmul_qt(s->kva+(int64_t)t*(kvl+R),n1,&l->kv_a,1);
+        rmsnorm(s->ckn+(int64_t)t*kvl,s->kva+(int64_t)t*(kvl+R),l->kv_a_ln,kvl,c->eps);
+        memcpy(s->kr+(int64_t)t*R,s->kva+(int64_t)t*(kvl+R)+kvl,R*sizeof(float));
+        rope_interleave(s->kr+(int64_t)t*R,t,c);
+        matmul_qt(s->kvb+(int64_t)t*H*(nope+vh),s->ckn+(int64_t)t*kvl,&l->kv_b,1);
+    }
+    /* causal attention, full materialization */
+    for(int h=0;h<H;h++) for(int t=0;t<T;t++){
+        const float *qp=s->q+(int64_t)t*H*qh+(int64_t)h*qh, *qr=qp+nope;
+        float *p=s->probs+((int64_t)h*T+t)*T;
+        for(int t2=0;t2<=t;t2++){
+            const float *kn=s->kvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh);
+            const float *kr=s->kr+(int64_t)t2*R;
+            float a=0; for(int d=0;d<nope;d++) a+=qp[d]*kn[d];
+            for(int d=0;d<R;d++) a+=qr[d]*kr[d];
+            p[t2]=a*c->attn_scale;
         }
-        /* causal attention, full materialization */
-        for(int h=0;h<H;h++) for(int t=0;t<T;t++){
-            const float *qp=s->q+(int64_t)t*H*qh+(int64_t)h*qh, *qr=qp+nope;
-            float *p=s->probs+((int64_t)h*T+t)*T;
-            for(int t2=0;t2<=t;t2++){
-                const float *kn=s->kvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh);
-                const float *kr=s->kr+(int64_t)t2*R;
-                float a=0; for(int d=0;d<nope;d++) a+=qp[d]*kn[d];
-                for(int d=0;d<R;d++) a+=qr[d]*kr[d];
-                p[t2]=a*c->attn_scale;
-            }
-            softmax(p,t+1);
-            for(int t2=t+1;t2<T;t2++) p[t2]=0;
-            float *cx=s->ctx+(int64_t)t*H*vh+(int64_t)h*vh;
-            for(int d=0;d<vh;d++) cx[d]=0;
-            for(int t2=0;t2<=t;t2++){
-                const float *v=s->kvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh)+nope;
-                float a=p[t2]; for(int d=0;d<vh;d++) cx[d]+=a*v[d];
-            }
+        softmax(p,t+1);
+        for(int t2=t+1;t2<T;t2++) p[t2]=0;
+        float *cx=s->ctx+(int64_t)t*H*vh+(int64_t)h*vh;
+        for(int d=0;d<vh;d++) cx[d]=0;
+        for(int t2=0;t2<=t;t2++){
+            const float *v=s->kvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh)+nope;
+            float a=p[t2]; for(int d=0;d<vh;d++) cx[d]+=a*v[d];
         }
-        /* o_proj + LoRA residual, add to stream */
-        {
-            const LoraTensor *lt=lora_find(tt->lora,li,LORA_T_O);
-            float *ao=falloc((int64_t)T*D);
-            matmul_qt(ao,s->ctx,&l->o,T);
-            if(lt) train_lora_fwd(lt,s->ctx,ao,s->z,T);
-            for(int64_t i=0;i<(int64_t)T*D;i++) tt->x[i]+=ao[i];
-            free(ao);
-        }
-        memcpy(s->x_mid,tt->x,(int64_t)T*D*sizeof(float));
-        for(int t=0;t<T;t++) rmsnorm(s->nrm2+(int64_t)t*D,s->x_mid+(int64_t)t*D,l->post_ln,D,c->eps);
-        /* mlp */
-        for(int t=0;t<T;t++){
-            const float *n2=s->nrm2+(int64_t)t*D;
-            float *y=tmp;
-            if(!l->sparse){
-                tt_swiglu_fwd(&l->gate_proj,&l->up_proj,&l->down_proj,n2,
-                              s->g+(int64_t)t*c->dense_inter,s->u+(int64_t)t*c->dense_inter,y);
-                for(int d=0;d<D;d++) tt->x[(int64_t)t*D+d]+=y[d];
-            } else {
-                int N=mi*c->n_shared;
-                tt_swiglu_fwd(&l->sh_gate,&l->sh_up,&l->sh_down,n2,
-                              s->g+(int64_t)t*N,s->u+(int64_t)t*N,y);
-                for(int d=0;d<D;d++) tt->x[(int64_t)t*D+d]+=y[d];
-                /* router: sigmoid probs, top-K by p+bias, weights = p normalized */
-                float lg[4096],ch[4096];
-                matmul(lg,n2,l->router,1,D,tt->E);
-                for(int e=0;e<tt->E;e++){ lg[e]=sigmoidf(lg[e]); ch[e]=lg[e]+l->router_bias[e]; }
-                int *idx=s->eidx+(int64_t)t*K; float *w=s->ew+(int64_t)t*K, *pp=s->ep+(int64_t)t*K;
+    }
+    /* o_proj + LoRA residual -> x_mid = x_in + attn_out */
+    {
+        const LoraTensor *lt=lora_find(tt->lora,li,LORA_T_O);
+        matmul_qt(s->x_mid,s->ctx,&l->o,T);
+        if(lt) train_lora_fwd(lt,s->ctx,s->x_mid,s->z,T);
+        for(int64_t i=0;i<(int64_t)T*D;i++) s->x_mid[i]+=s->x_in[i];
+    }
+    for(int t=0;t<T;t++) rmsnorm(s->nrm2+(int64_t)t*D,s->x_mid+(int64_t)t*D,l->post_ln,D,c->eps);
+    if(x_out) memcpy(x_out,s->x_mid,(int64_t)T*D*sizeof(float));
+    /* mlp */
+    float *y=falloc(D);
+    for(int t=0;t<T;t++){
+        const float *n2=s->nrm2+(int64_t)t*D;
+        if(!l->sparse){
+            tt_swiglu_fwd(&l->gate_proj,&l->up_proj,&l->down_proj,n2,
+                          s->g+(int64_t)t*c->dense_inter,s->u+(int64_t)t*c->dense_inter,y);
+            if(x_out) for(int d=0;d<D;d++) x_out[(int64_t)t*D+d]+=y[d];
+        } else {
+            int N=mi*c->n_shared;
+            tt_swiglu_fwd(&l->sh_gate,&l->sh_up,&l->sh_down,n2,
+                          s->g+(int64_t)t*N,s->u+(int64_t)t*N,y);
+            if(x_out) for(int d=0;d<D;d++) x_out[(int64_t)t*D+d]+=y[d];
+            /* router: sigmoid probs; selection top-K by p+bias — or replay */
+            float lg[4096];
+            matmul(lg,n2,l->router,1,D,tt->E);
+            for(int e=0;e<tt->E;e++) lg[e]=sigmoidf(lg[e]);
+            int *idx=s->eidx+(int64_t)t*K; float *w=s->ew+(int64_t)t*K, *pp=s->ep+(int64_t)t*K;
+            if(!replay){
+                float ch[4096];
+                for(int e=0;e<tt->E;e++) ch[e]=lg[e]+l->router_bias[e];
                 for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
                     for(int e=0;e<tt->E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
                         if(!tk&&ch[e]>bv){bv=ch[e];best=e;} }
-                    idx[kk]=best; pp[kk]=lg[best];
-                }
-                float sm=0; for(int kk=0;kk<K;kk++) sm+=pp[kk];
-                for(int kk=0;kk<K;kk++)
-                    w[kk]=(c->norm_topk ? pp[kk]/(sm+1e-20f) : pp[kk])*c->routed_scale;
-                for(int kk=0;kk<K;kk++){
-                    QT *ew=tt->ew[li*tt->E+idx[kk]];
-                    float *eo=s->eout+((int64_t)t*K+kk)*D;
-                    tt_swiglu_fwd(&ew[0],&ew[1],&ew[2],n2,
-                                  s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,eo);
-                    for(int d=0;d<D;d++) tt->x[(int64_t)t*D+d]+=w[kk]*eo[d];
+                    idx[kk]=best;
                 }
             }
+            for(int kk=0;kk<K;kk++) pp[kk]=lg[idx[kk]];
+            float sm=0; for(int kk=0;kk<K;kk++) sm+=pp[kk];
+            for(int kk=0;kk<K;kk++)
+                w[kk]=(c->norm_topk ? pp[kk]/(sm+1e-20f) : pp[kk])*c->routed_scale;
+            for(int kk=0;kk<K;kk++){
+                QT *ew=tt->expw[li*tt->E+idx[kk]];
+                float *eo=s->eout+((int64_t)t*K+kk)*D;
+                tt_swiglu_fwd(&ew[0],&ew[1],&ew[2],n2,
+                              s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,eo);
+                if(x_out) for(int d=0;d<D;d++) x_out[(int64_t)t*D+d]+=w[kk]*eo[d];
+            }
         }
+    }
+    free(y);
+}
+
+/* ---------- one layer backward (stash must be valid for this layer) ----------
+ * dx enters as dL/d(layer output) [T,D] and leaves as dL/d(layer input). */
+static void tt_layer_backward(TT *tt, int li, TTLayer *s, float *dx){
+    Model *m=tt->m; Cfg *c=&m->c; Layer *l=&m->L[li];
+    int T=tt->T,D=tt->D,H=tt->H,qh=tt->qh,vh=tt->vh,nope=tt->nope,kvl=tt->kvl,R=tt->R,K=tt->K,mi=tt->mi;
+    /* ---- mlp backward: dx currently holds dL/d(x after mlp add) ---- */
+    float *dn2=falloc((int64_t)T*D); memset(dn2,0,(int64_t)T*D*sizeof(float));
+    for(int t=0;t<T;t++){
+        const float *dy=dx+(int64_t)t*D;
+        if(!l->sparse){
+            tt_swiglu_bwd(&l->gate_proj,&l->up_proj,&l->down_proj,
+                          s->g+(int64_t)t*c->dense_inter,s->u+(int64_t)t*c->dense_inter,
+                          dy,dn2+(int64_t)t*D);
+        } else {
+            int N=mi*c->n_shared;
+            tt_swiglu_bwd(&l->sh_gate,&l->sh_up,&l->sh_down,
+                          s->g+(int64_t)t*N,s->u+(int64_t)t*N,dy,dn2+(int64_t)t*D);
+            const int *idx=s->eidx+(int64_t)t*K; const float *w=s->ew+(int64_t)t*K, *pp=s->ep+(int64_t)t*K;
+            float dwl[64], deo[4096];
+            for(int kk=0;kk<K;kk++){
+                QT *ew=tt->expw[li*tt->E+idx[kk]];
+                const float *eo=s->eout+((int64_t)t*K+kk)*D;
+                double a=0; for(int d=0;d<D;d++) a+=(double)eo[d]*dy[d];
+                dwl[kk]=(float)a;                     /* dL/dw_k */
+                for(int d=0;d<D;d++) deo[d]=w[kk]*dy[d];
+                tt_swiglu_bwd(&ew[0],&ew[1],&ew[2],
+                              s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,
+                              deo,dn2+(int64_t)t*D);
+            }
+            /* through gate values: w_k = scale * p_k / sum(p) (norm_topk) */
+            float dp[64];
+            if(c->norm_topk){
+                float sm=0; for(int kk=0;kk<K;kk++) sm+=pp[kk]; sm+=1e-20f;
+                double wd=0; for(int kk=0;kk<K;kk++) wd+=(double)dwl[kk]*pp[kk];
+                for(int kk=0;kk<K;kk++)
+                    dp[kk]=c->routed_scale*(dwl[kk]/sm-(float)(wd/((double)sm*sm)));
+            } else for(int kk=0;kk<K;kk++) dp[kk]=c->routed_scale*dwl[kk];
+            for(int kk=0;kk<K;kk++){
+                float dl=dp[kk]*pp[kk]*(1.f-pp[kk]);  /* sigmoid' */
+                const float *rr=l->router+(int64_t)idx[kk]*D;
+                for(int d=0;d<D;d++) dn2[(int64_t)t*D+d]+=dl*rr[d];
+            }
+        }
+        /* post_ln backward; residual passthrough keeps dx as-is */
+        tt_rmsnorm_bwd(s->x_mid+(int64_t)t*D,l->post_ln,dn2+(int64_t)t*D,dx+(int64_t)t*D,D,c->eps);
+    }
+    free(dn2);
+    /* ---- attention backward: dx holds dL/d(x after attn add) ---- */
+    float *dctx=falloc((int64_t)T*H*vh); memset(dctx,0,(int64_t)T*H*vh*sizeof(float));
+    const LoraTensor *lt=lora_find(tt->lora,li,LORA_T_O);
+    train_qt_bwd_dx(&l->o,dx,dctx,T);
+    if(lt){
+        int ai=-1; for(int i=0;i<tt->lora->n;i++) if(&tt->lora->t[i]==lt){ ai=i; break; }
+        train_lora_bwd(lt,s->ctx,s->z,dx,tt->dA[ai],tt->dB[ai],dctx,T);
+    }
+    float *dq=falloc((int64_t)T*H*qh);       memset(dq,0,(int64_t)T*H*qh*sizeof(float));
+    float *dkvb=falloc((int64_t)T*H*(nope+vh)); memset(dkvb,0,(int64_t)T*H*(nope+vh)*sizeof(float));
+    float *dkr=falloc((int64_t)T*R);         memset(dkr,0,(int64_t)T*R*sizeof(float));
+    float *dp=falloc(T), *ds=falloc(T);
+    for(int h=0;h<H;h++) for(int t=0;t<T;t++){
+        const float *p=s->probs+((int64_t)h*T+t)*T;
+        const float *dcx=dctx+(int64_t)t*H*vh+(int64_t)h*vh;
+        for(int t2=0;t2<=t;t2++){
+            const float *v=s->kvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh)+nope;
+            float a=0; for(int d=0;d<vh;d++) a+=dcx[d]*v[d];
+            dp[t2]=a;
+            float *dv=dkvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh)+nope;
+            for(int d=0;d<vh;d++) dv[d]+=p[t2]*dcx[d];
+        }
+        tt_softmax_bwd(p,dp,ds,t+1);
+        const float *qp=s->q+(int64_t)t*H*qh+(int64_t)h*qh, *qr=qp+nope;
+        float *dqp=dq+(int64_t)t*H*qh+(int64_t)h*qh, *dqr=dqp+nope;
+        for(int t2=0;t2<=t;t2++){
+            float a=ds[t2]*c->attn_scale;
+            const float *kn=s->kvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh);
+            const float *kr=s->kr+(int64_t)t2*R;
+            float *dkn=dkvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh);
+            for(int d=0;d<nope;d++){ dqp[d]+=a*kn[d]; dkn[d]+=a*qp[d]; }
+            for(int d=0;d<R;d++){ dqr[d]+=a*kr[d]; dkr[(int64_t)t2*R+d]+=a*qr[d]; }
+        }
+    }
+    free(dp); free(ds);
+    /* projections backward into dnrm1, then rmsnorm into dx (residual keeps dx) */
+    float *dn1=falloc((int64_t)T*D); memset(dn1,0,(int64_t)T*D*sizeof(float));
+    float *dckn=falloc(kvl), *dkva=falloc(kvl+R), *dqan=falloc(c->q_lora), *dqa=falloc(c->q_lora);
+    for(int t=0;t<T;t++){
+        /* kv path */
+        memset(dckn,0,kvl*sizeof(float));
+        train_qt_bwd_dx(&l->kv_b,dkvb+(int64_t)t*H*(nope+vh),dckn,1);
+        memset(dkva,0,(kvl+R)*sizeof(float));
+        tt_rmsnorm_bwd(s->kva+(int64_t)t*(kvl+R),l->kv_a_ln,dckn,dkva,kvl,c->eps);
+        float drr[256]; memcpy(drr,dkr+(int64_t)t*R,R*sizeof(float));
+        tt_rope_bwd(drr,t,c);
+        for(int d=0;d<R;d++) dkva[kvl+d]+=drr[d];
+        train_qt_bwd_dx(&l->kv_a,dkva,dn1+(int64_t)t*D,1);
+        /* q path: un-rope grad per head, then q_b^T, q_a_ln, q_a^T */
+        float *dqt=dq+(int64_t)t*H*qh;
+        for(int h=0;h<H;h++) tt_rope_bwd(dqt+(int64_t)h*qh+nope,t,c);
+        memset(dqan,0,c->q_lora*sizeof(float));
+        train_qt_bwd_dx(&l->q_b,dqt,dqan,1);
+        memset(dqa,0,c->q_lora*sizeof(float));
+        tt_rmsnorm_bwd(s->qa+(int64_t)t*c->q_lora,l->q_a_ln,dqan,dqa,c->q_lora,c->eps);
+        train_qt_bwd_dx(&l->q_a,dqa,dn1+(int64_t)t*D,1);
+        tt_rmsnorm_bwd(s->x_in+(int64_t)t*D,l->in_ln,dn1+(int64_t)t*D,dx+(int64_t)t*D,D,c->eps);
+    }
+    free(dckn); free(dkva); free(dqan); free(dqa);
+    free(dn1); free(dq); free(dkvb); free(dkr); free(dctx);
+}
+
+/* ---------- full forward ---------- */
+static float tt_forward(TT *tt, const int *tok){
+    Model *m=tt->m; Cfg *c=&m->c;
+    int T=tt->T,D=tt->D;
+    for(int t=0;t<T;t++) embed_row(m,tok[t],tt->x+(int64_t)t*D);
+    for(int li=0;li<c->n_layers;li++){
+        TTLayer *s=&tt->L[li];
+        memcpy(s->x_in,tt->x,(int64_t)T*D*sizeof(float));
+        tt_layer_forward(tt,li,s,tt->x,0);
     }
     /* head + mean CE over positions 0..T-2 predicting tok[t+1] */
     double lsum=0; int V=c->vocab, np=T-1;
@@ -265,16 +425,17 @@ static float tt_forward(TT *tt, const int *tok){
         double se=0; for(int i=0;i<V;i++) se+=exp((double)lo[i]-mx);
         lsum += (mx+log(se)) - (double)lo[tok[t+1]];
     }
-    free(tmp);
     tt->loss=(float)(lsum/np);
     return tt->loss;
 }
 
-/* ---------- backward ---------- */
+/* ---------- full backward ----------
+ * ckpt=0: every layer's stash is still valid from tt_forward.
+ * ckpt=1: only x_in + routing ids survived; recompute the layer stash
+ * (routing replayed) right before its backward — memory stays O(1 layer). */
 static void tt_backward(TT *tt, const int *tok){
     Model *m=tt->m; Cfg *c=&m->c;
-    int T=tt->T,D=tt->D,H=tt->H,qh=tt->qh,vh=tt->vh,nope=tt->nope,kvl=tt->kvl,R=tt->R,K=tt->K,mi=tt->mi;
-    int V=c->vocab, np=T-1;
+    int T=tt->T,D=tt->D,V=c->vocab,np=T-1;
     for(int i=0;i<tt->lora->n;i++){
         memset(tt->dA[i],0,(size_t)tt->lora->rank*tt->lora->t[i].I*sizeof(float));
         memset(tt->dB[i],0,(size_t)tt->lora->t[i].O*tt->lora->rank*sizeof(float));
@@ -295,115 +456,12 @@ static void tt_backward(TT *tt, const int *tok){
         }
         free(dlog); free(dfn);
     }
-    /* layers in reverse */
-    float *dn=falloc(D), *dctx_t=falloc(D);
     for(int li=c->n_layers-1;li>=0;li--){
-        Layer *l=&m->L[li]; TTLayer *s=&tt->L[li];
-        /* ---- mlp backward: dx currently holds dL/d(x after mlp add) ---- */
-        float *dn2=falloc((int64_t)T*D); memset(dn2,0,(int64_t)T*D*sizeof(float));
-        for(int t=0;t<T;t++){
-            const float *dy=dx+(int64_t)t*D;
-            if(!l->sparse){
-                tt_swiglu_bwd(&l->gate_proj,&l->up_proj,&l->down_proj,
-                              s->g+(int64_t)t*c->dense_inter,s->u+(int64_t)t*c->dense_inter,
-                              dy,dn2+(int64_t)t*D);
-            } else {
-                int N=mi*c->n_shared;
-                tt_swiglu_bwd(&l->sh_gate,&l->sh_up,&l->sh_down,
-                              s->g+(int64_t)t*N,s->u+(int64_t)t*N,dy,dn2+(int64_t)t*D);
-                const int *idx=s->eidx+(int64_t)t*K; const float *w=s->ew+(int64_t)t*K, *pp=s->ep+(int64_t)t*K;
-                float dwl[64], deo[4096];
-                for(int kk=0;kk<K;kk++){
-                    QT *ew=tt->ew[li*tt->E+idx[kk]];
-                    const float *eo=s->eout+((int64_t)t*K+kk)*D;
-                    double a=0; for(int d=0;d<D;d++) a+=(double)eo[d]*dy[d];
-                    dwl[kk]=(float)a;                     /* dL/dw_k */
-                    for(int d=0;d<D;d++) deo[d]=w[kk]*dy[d];
-                    tt_swiglu_bwd(&ew[0],&ew[1],&ew[2],
-                                  s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,
-                                  deo,dn2+(int64_t)t*D);
-                }
-                /* through gate values: w_k = scale * p_k / sum(p) (norm_topk) */
-                float dp[64];
-                if(c->norm_topk){
-                    float sm=0; for(int kk=0;kk<K;kk++) sm+=pp[kk]; sm+=1e-20f;
-                    double wd=0; for(int kk=0;kk<K;kk++) wd+=(double)dwl[kk]*pp[kk];
-                    for(int kk=0;kk<K;kk++)
-                        dp[kk]=c->routed_scale*(dwl[kk]/sm-(float)(wd/((double)sm*sm)));
-                } else for(int kk=0;kk<K;kk++) dp[kk]=c->routed_scale*dwl[kk];
-                for(int kk=0;kk<K;kk++){
-                    float dl=dp[kk]*pp[kk]*(1.f-pp[kk]);  /* sigmoid' */
-                    const float *rr=l->router+(int64_t)idx[kk]*D;
-                    for(int d=0;d<D;d++) dn2[(int64_t)t*D+d]+=dl*rr[d];
-                }
-            }
-            /* post_ln backward; residual passthrough keeps dx as-is */
-            tt_rmsnorm_bwd(s->x_mid+(int64_t)t*D,l->post_ln,dn2+(int64_t)t*D,dx+(int64_t)t*D,D,c->eps);
-        }
-        free(dn2);
-        /* ---- attention backward: dx holds dL/d(x after attn add) ---- */
-        float *dctx=falloc((int64_t)T*H*vh); memset(dctx,0,(int64_t)T*H*vh*sizeof(float));
-        const LoraTensor *lt=lora_find(tt->lora,li,LORA_T_O);
-        /* o_proj: dctx = o^T dy (+ LoRA bwd) */
-        train_qt_bwd_dx(&l->o,dx,dctx,T);
-        if(lt){
-            int ai=-1; for(int i=0;i<tt->lora->n;i++) if(&tt->lora->t[i]==lt){ ai=i; break; }
-            train_lora_bwd(lt,s->ctx,s->z,dx,tt->dA[ai],tt->dB[ai],dctx,T);
-        }
-        float *dq=falloc((int64_t)T*H*qh);       memset(dq,0,(int64_t)T*H*qh*sizeof(float));
-        float *dkvb=falloc((int64_t)T*H*(nope+vh)); memset(dkvb,0,(int64_t)T*H*(nope+vh)*sizeof(float));
-        float *dkr=falloc((int64_t)T*R);         memset(dkr,0,(int64_t)T*R*sizeof(float));
-        float *dp=falloc(T), *ds=falloc(T);
-        for(int h=0;h<H;h++) for(int t=0;t<T;t++){
-            const float *p=s->probs+((int64_t)h*T+t)*T;
-            const float *dcx=dctx+(int64_t)t*H*vh+(int64_t)h*vh;
-            for(int t2=0;t2<=t;t2++){
-                const float *v=s->kvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh)+nope;
-                float a=0; for(int d=0;d<vh;d++) a+=dcx[d]*v[d];
-                dp[t2]=a;
-                float *dv=dkvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh)+nope;
-                for(int d=0;d<vh;d++) dv[d]+=p[t2]*dcx[d];
-            }
-            tt_softmax_bwd(p,dp,ds,t+1);
-            const float *qp=s->q+(int64_t)t*H*qh+(int64_t)h*qh, *qr=qp+nope;
-            float *dqp=dq+(int64_t)t*H*qh+(int64_t)h*qh, *dqr=dqp+nope;
-            for(int t2=0;t2<=t;t2++){
-                float a=ds[t2]*c->attn_scale;
-                const float *kn=s->kvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh);
-                const float *kr=s->kr+(int64_t)t2*R;
-                float *dkn=dkvb+(int64_t)t2*H*(nope+vh)+(int64_t)h*(nope+vh);
-                for(int d=0;d<nope;d++){ dqp[d]+=a*kn[d]; dkn[d]+=a*qp[d]; }
-                for(int d=0;d<R;d++){ dqr[d]+=a*kr[d]; dkr[(int64_t)t2*R+d]+=a*qr[d]; }
-            }
-        }
-        free(dp); free(ds);
-        /* projections backward into dnrm1, then rmsnorm into dx (residual keeps dx) */
-        float *dn1=falloc((int64_t)T*D); memset(dn1,0,(int64_t)T*D*sizeof(float));
-        float *dckn=falloc(kvl), *dkva=falloc(kvl+R), *dqan=falloc(c->q_lora), *dqa=falloc(c->q_lora);
-        for(int t=0;t<T;t++){
-            /* kv path */
-            memset(dckn,0,kvl*sizeof(float));
-            train_qt_bwd_dx(&l->kv_b,dkvb+(int64_t)t*H*(nope+vh),dckn,1);
-            memset(dkva,0,(kvl+R)*sizeof(float));
-            tt_rmsnorm_bwd(s->kva+(int64_t)t*(kvl+R),l->kv_a_ln,dckn,dkva,kvl,c->eps);
-            float drr[256]; memcpy(drr,dkr+(int64_t)t*R,R*sizeof(float));
-            tt_rope_bwd(drr,t,c);
-            for(int d=0;d<R;d++) dkva[kvl+d]+=drr[d];
-            train_qt_bwd_dx(&l->kv_a,dkva,dn1+(int64_t)t*D,1);
-            /* q path: un-rope grad per head, then q_b^T, q_a_ln, q_a^T */
-            float *dqt=dq+(int64_t)t*H*qh;
-            for(int h=0;h<H;h++) tt_rope_bwd(dqt+(int64_t)h*qh+nope,t,c);
-            memset(dqan,0,c->q_lora*sizeof(float));
-            train_qt_bwd_dx(&l->q_b,dqt,dqan,1);
-            memset(dqa,0,c->q_lora*sizeof(float));
-            tt_rmsnorm_bwd(s->qa+(int64_t)t*c->q_lora,l->q_a_ln,dqan,dqa,c->q_lora,c->eps);
-            train_qt_bwd_dx(&l->q_a,dqa,dn1+(int64_t)t*D,1);
-            tt_rmsnorm_bwd(s->x_in+(int64_t)t*D,l->in_ln,dn1+(int64_t)t*D,dx+(int64_t)t*D,D,c->eps);
-        }
-        free(dckn); free(dkva); free(dqan); free(dqa);
-        free(dn1); free(dq); free(dkvb); free(dkr); free(dctx);
+        TTLayer *s=&tt->L[li];
+        if(tt->ckpt) tt_layer_forward(tt,li,s,NULL,1);   /* recompute from checkpoint */
+        tt_layer_backward(tt,li,s,dx);
     }
-    free(dn); free(dctx_t); free(dx);
+    free(dx);
 }
 
 #endif /* TRAIN_MODEL_H */

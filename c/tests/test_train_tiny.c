@@ -67,7 +67,7 @@ int main(void){
     int steps=(int)jreq(J,"steps")->num;
     float lr=(float)jreq(J,"lr")->num;
 
-    TT *tt=tt_init(&M,lora,T);
+    TT *tt=tt_init(&M,lora,T,0);
 
     /* 1) forward loss parity */
     float loss0=(float)jreq(J,"loss0")->num;
@@ -94,7 +94,27 @@ int main(void){
     }
     CHECK(gmax<5e-4f);
 
-    /* 3) AdamW trajectory + final adapter tensors */
+    /* 2b) M4: activation-checkpointed mode — same loss, same gradients (the
+     * recompute replays routing through the same kernels in the same order, so
+     * parity should be essentially bitwise), with O(1-layer) stash memory. */
+    TT *tc=tt_init(&M,lora,T,1);
+    float lck=tt_forward(tc,tok);
+    CHECK(fabsf(lck-loss)<=1e-7f);
+    tt_backward(tc,tok);
+    float cmax=0;
+    for(int i=0;i<lora->n;i++){
+        LoraTensor *t=&lora->t[i];
+        float ea=relerr(tc->dA[i],tt->dA[i],(int64_t)t->rank*t->I);
+        float eb=relerr(tc->dB[i],tt->dB[i],(int64_t)t->O*t->rank);
+        if(ea>cmax)cmax=ea; if(eb>cmax)cmax=eb;
+    }
+    printf("checkpointed vs retained: grad max rel %.2e | stash %.2f MB vs %.2f MB\n",
+           cmax,tc->bytes_stash/1048576.0,tt->bytes_stash/1048576.0);
+    CHECK(cmax<1e-6f);
+    CHECK(tc->bytes_stash*2<tt->bytes_stash);   /* bounded: ~1 layer + checkpoints */
+
+    /* 3) AdamW trajectory + final adapter tensors — run in CHECKPOINTED mode:
+     * training end-to-end must work with recompute, not just one backward. */
     jval *jl=jreq(J,"losses"); CHECK(jl->len==steps+1);
     AdamW opt=adamw_default(lr);
     float **sm=calloc(lora->n*2,sizeof(float*)), **sv=calloc(lora->n*2,sizeof(float*));
@@ -105,18 +125,18 @@ int main(void){
     }
     float trajmax=0;
     for(int s=0;s<steps;s++){
-        float l=(s==0)?loss:tt_forward(tt,tok);
+        float l=(s==0)?lck:tt_forward(tc,tok);
         float ref=(float)jl->kids[s]->num, e=fabsf(l-ref)/ref;
         if(e>trajmax)trajmax=e;
-        tt_backward(tt,tok);
+        tt_backward(tc,tok);
         adamw_tick(&opt);
         for(int i=0;i<lora->n;i++){
             LoraTensor *t=&lora->t[i];
-            CHECK(adamw_step(&opt,t->A,tt->dA[i],sm[2*i],sv[2*i],(int64_t)t->rank*t->I)==0);
-            CHECK(adamw_step(&opt,t->B,tt->dB[i],sm[2*i+1],sv[2*i+1],(int64_t)t->O*t->rank)==0);
+            CHECK(adamw_step(&opt,t->A,tc->dA[i],sm[2*i],sv[2*i],(int64_t)t->rank*t->I)==0);
+            CHECK(adamw_step(&opt,t->B,tc->dB[i],sm[2*i+1],sv[2*i+1],(int64_t)t->O*t->rank)==0);
         }
     }
-    float lfin=tt_forward(tt,tok);
+    float lfin=tt_forward(tc,tok);
     float reff=(float)jl->kids[steps]->num, ef=fabsf(lfin-reff)/reff;
     if(ef>trajmax)trajmax=ef;
     printf("trajectory: %.4f -> %.4f (torch %.4f -> %.4f), max rel %.2e\n",

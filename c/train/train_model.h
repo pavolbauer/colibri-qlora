@@ -302,7 +302,7 @@ static void tt_backward(TT *tt, const int *tok){
         /* ---- mlp backward: dx currently holds dL/d(x after mlp add) ---- */
         float *dn2=falloc((int64_t)T*D); memset(dn2,0,(int64_t)T*D*sizeof(float));
         for(int t=0;t<T;t++){
-            const float *dy=dx+(int64_t)t*D, *n2=s->nrm2+(int64_t)t*D;
+            const float *dy=dx+(int64_t)t*D;
             if(!l->sparse){
                 tt_swiglu_bwd(&l->gate_proj,&l->up_proj,&l->down_proj,
                               s->g+(int64_t)t*c->dense_inter,s->u+(int64_t)t*c->dense_inter,

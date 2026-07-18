@@ -42,8 +42,9 @@ failure. The full design, memory model, and milestone gates are in
 | M0 — baseline preserved (`make check`, `METAL=1`, token-exact tiny oracle) | ✅ |
 | M1 — `colibri-lora-v1` adapter format + inference application | ✅ |
 | M2 — toy frozen-int4 linear + LoRA trainer, gradients vs PyTorch float64 | ✅ |
-| M3 — full-block training forward/backward on the tiny GLM oracle | 🚧 in progress |
-| M4–M9 — checkpointed backward, streamed-expert training, Metal kernels, real 64 GB run | ⏳ |
+| M3 — full-block training forward/backward on the tiny GLM oracle, gradients + AdamW trajectory vs PyTorch | ✅ |
+| M4 — activation-checkpointed backward (bounded memory) | 🚧 next |
+| M5–M9 — streamed-expert training, Metal kernels, real 64 GB run | ⏳ |
 
 **What exists so far**
 

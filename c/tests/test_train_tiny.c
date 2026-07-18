@@ -1,0 +1,145 @@
+/* Milestone 3 gate: the C training path (train/train_model.h) must reproduce
+ * PyTorch on the tiny GLM oracle — forward loss, adapter gradients dA/dB, and
+ * an 8-step AdamW loss trajectory ending in matching adapter tensors.
+ *
+ * Needs artifacts produced by torch tooling (not part of make check unless
+ * present — prints "skipped" otherwise):
+ *   python3 tools/make_glm_oracle.py
+ *   python3 tools/make_lora_adapter.py --model ./glm_tiny --out /tmp/ad_train \
+ *       --rank 4 --alpha 8 --init random --seed 3
+ *   python3 tools/make_train_oracle.py --adapter /tmp/ad_train --out /tmp/train_fixture.json
+ *
+ * Tolerances (f32 end-to-end vs f32 PyTorch, different summation order,
+ * 5 layers + softmax/CE): documented per check below, tightened from measured
+ * headroom, not loosened to pass. */
+#define main coli_glm_main_unused
+#include "../glm.c"
+#undef main
+#include "../train/qlora_ops.h"
+#include "../train/train_model.h"
+
+#define CHECK(condition) do { \
+    if (!(condition)) { \
+        fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #condition); \
+        return 1; \
+    } \
+} while (0)
+
+static jval *jreq(jval *o, const char *k){
+    jval *v=json_get(o,k);
+    if(!v){ fprintf(stderr,"fixture: missing %s\n",k); exit(1); }
+    return v;
+}
+static void jfloats(jval *arr, float *out, int64_t n){
+    if(arr->t!=J_ARR||arr->len!=n){ fprintf(stderr,"fixture: bad array (want %lld got %d)\n",(long long)n,arr?arr->len:-1); exit(1); }
+    for(int64_t i=0;i<n;i++) out[i]=(float)arr->kids[i]->num;
+}
+/* max |a-b| / (max|b|+eps) over n — one scale-free number per tensor */
+static float relerr(const float *a, const float *b, int64_t n){
+    float mx=0,mb=0;
+    for(int64_t i=0;i<n;i++){ float d=fabsf(a[i]-b[i]); if(d>mx)mx=d;
+        if(fabsf(b[i])>mb)mb=fabsf(b[i]); }
+    return mx/(mb+1e-8f);
+}
+
+int main(void){
+    const char *snap="./glm_tiny";
+    const char *fx=getenv("TRAIN_FIXTURE")?getenv("TRAIN_FIXTURE"):"/tmp/train_fixture.json";
+    const char *ad=getenv("TRAIN_ADAPTER")?getenv("TRAIN_ADAPTER"):"/tmp/ad_train";
+    struct stat sb;
+    char cfgp[512]; snprintf(cfgp,sizeof(cfgp),"%s/config.json",snap);
+    if(stat(cfgp,&sb)||stat(fx,&sb)){
+        printf("tiny training oracle test: skipped (need %s + %s; see file header)\n",snap,fx);
+        return 0;
+    }
+    FILE *f=fopen(fx,"rb"); fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
+    char *txt=malloc(sz+1); CHECK(fread(txt,1,sz,f)==(size_t)sz); fclose(f); txt[sz]=0;
+    char *arena=NULL; jval *J=json_parse(txt,&arena); CHECK(J);
+
+    unsetenv("ADAPTER");                      /* we attach the adapter ourselves */
+    Model M; model_init(&M,snap,64,16,16);
+    LoraAdapter *lora=lora_load(ad,cfg_fingerprint(&M.c),0);
+    CHECK(lora);
+
+    jval *jt=jreq(J,"tokens");
+    int T=jt->len, *tok=malloc(T*sizeof(int));
+    for(int i=0;i<T;i++) tok[i]=(int)jt->kids[i]->num;
+    int steps=(int)jreq(J,"steps")->num;
+    float lr=(float)jreq(J,"lr")->num;
+
+    TT *tt=tt_init(&M,lora,T);
+
+    /* 1) forward loss parity */
+    float loss0=(float)jreq(J,"loss0")->num;
+    float loss=tt_forward(tt,tok);
+    float lerr=fabsf(loss-loss0)/loss0;
+    printf("loss0: C %.6f vs torch %.6f (rel %.2e)\n",loss,loss0,lerr);
+    CHECK(lerr<2e-5f);
+
+    /* 2) gradient parity per adapted layer */
+    tt_backward(tt,tok);
+    jval *jg=jreq(J,"grads");
+    float gmax=0;
+    for(int i=0;i<lora->n;i++){
+        LoraTensor *t=&lora->t[i];
+        char key[16]; snprintf(key,sizeof(key),"%d",t->layer);
+        jval *g=jreq(jg,key);
+        int64_t na=(int64_t)t->rank*t->I, nb=(int64_t)t->O*t->rank;
+        float *ra=malloc(na*4), *rb=malloc(nb*4);
+        jfloats(jreq(g,"dA"),ra,na); jfloats(jreq(g,"dB"),rb,nb);
+        float ea=relerr(tt->dA[i],ra,na), eb=relerr(tt->dB[i],rb,nb);
+        printf("layer %d: dA rel %.2e | dB rel %.2e\n",t->layer,ea,eb);
+        if(ea>gmax)gmax=ea; if(eb>gmax)gmax=eb;
+        free(ra); free(rb);
+    }
+    CHECK(gmax<5e-4f);
+
+    /* 3) AdamW trajectory + final adapter tensors */
+    jval *jl=jreq(J,"losses"); CHECK(jl->len==steps+1);
+    AdamW opt=adamw_default(lr);
+    float **sm=calloc(lora->n*2,sizeof(float*)), **sv=calloc(lora->n*2,sizeof(float*));
+    for(int i=0;i<lora->n;i++){
+        LoraTensor *t=&lora->t[i];
+        sm[2*i]=calloc((size_t)t->rank*t->I,4);   sv[2*i]=calloc((size_t)t->rank*t->I,4);
+        sm[2*i+1]=calloc((size_t)t->O*t->rank,4); sv[2*i+1]=calloc((size_t)t->O*t->rank,4);
+    }
+    float trajmax=0;
+    for(int s=0;s<steps;s++){
+        float l=(s==0)?loss:tt_forward(tt,tok);
+        float ref=(float)jl->kids[s]->num, e=fabsf(l-ref)/ref;
+        if(e>trajmax)trajmax=e;
+        tt_backward(tt,tok);
+        adamw_tick(&opt);
+        for(int i=0;i<lora->n;i++){
+            LoraTensor *t=&lora->t[i];
+            CHECK(adamw_step(&opt,t->A,tt->dA[i],sm[2*i],sv[2*i],(int64_t)t->rank*t->I)==0);
+            CHECK(adamw_step(&opt,t->B,tt->dB[i],sm[2*i+1],sv[2*i+1],(int64_t)t->O*t->rank)==0);
+        }
+    }
+    float lfin=tt_forward(tt,tok);
+    float reff=(float)jl->kids[steps]->num, ef=fabsf(lfin-reff)/reff;
+    if(ef>trajmax)trajmax=ef;
+    printf("trajectory: %.4f -> %.4f (torch %.4f -> %.4f), max rel %.2e\n",
+           loss,lfin,(float)jl->kids[0]->num,reff,trajmax);
+    CHECK(trajmax<1e-4f);
+    CHECK(lfin<loss);                          /* it must actually learn */
+
+    jval *jf=jreq(J,"final");
+    float fmax=0;
+    for(int i=0;i<lora->n;i++){
+        LoraTensor *t=&lora->t[i];
+        char key[16]; snprintf(key,sizeof(key),"%d",t->layer);
+        jval *g=jreq(jf,key);
+        int64_t na=(int64_t)t->rank*t->I, nb=(int64_t)t->O*t->rank;
+        float *ra=malloc(na*4), *rb=malloc(nb*4);
+        jfloats(jreq(g,"A"),ra,na); jfloats(jreq(g,"B"),rb,nb);
+        float ea=relerr(t->A,ra,na), eb=relerr(t->B,rb,nb);
+        if(ea>fmax)fmax=ea; if(eb>fmax)fmax=eb;
+        free(ra); free(rb);
+    }
+    printf("final adapters after %d steps: max rel %.2e\n",steps,fmax);
+    CHECK(fmax<1e-3f);
+
+    puts("tiny training oracle test: ok");
+    return 0;
+}

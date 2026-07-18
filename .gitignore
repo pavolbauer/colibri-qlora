@@ -73,3 +73,5 @@ c/tests/test_lora.exe
 c/tests/test_kv_alloc
 c/tests/test_kv_alloc.exe
 c/glm_tiny/
+c/tests/test_train_linear
+c/tests/test_train_linear.exe

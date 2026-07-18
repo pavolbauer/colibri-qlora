@@ -68,3 +68,8 @@ c/tests/test_decode_batch
 c/tests/test_i4_acc512
 c/tests/test_idot
 c/tests/test_uring
+c/tests/test_lora
+c/tests/test_lora.exe
+c/tests/test_kv_alloc
+c/tests/test_kv_alloc.exe
+c/glm_tiny/

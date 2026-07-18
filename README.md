@@ -1,3 +1,9 @@
+> **🧪 QLoRA training fork** — this fork adds an experimental, memory-bounded
+> **LoRA/SFT training path** for GLM-5.2 on a **64 GB Apple Silicon Mac**, built on
+> Colibrì's streamed int4 runtime. All work lives on the `qlora-train` branch;
+> `main` tracks upstream. See [QLoRA fine-tuning](#qlora-fine-tuning-this-fork)
+> below and the full implementation brief in [AGENTS.md](AGENTS.md).
+
 <p align="center">
   <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
 </p>
@@ -16,6 +22,65 @@ $ ./coli chat
   › ciao!
   ◆ Ciao! 😊 Come posso aiutarti oggi?
 ```
+
+## QLoRA fine-tuning (this fork)
+
+The same property that makes 744B *inference* possible on a small machine —
+dense state resident, routed experts streamed from NVMe — is being extended to
+*training*: fine-tune *small LoRA adapters* against the frozen int4 base without
+ever holding the ~370 GB expert set in memory, and without gradients or
+optimizer state for any frozen weight. Attention-projection adapters only in v1
+(never all 19k routed experts), activation recomputation instead of a retained
+graph, and a hard RSS budget (≤ 52 GB on the 64 GB target) with swap treated as
+failure. The full design, memory model, and milestone gates are in
+[AGENTS.md](AGENTS.md).
+
+**Status** (every milestone gated on tests / oracle parity):
+
+| Milestone | State |
+|---|---|
+| M0 — baseline preserved (`make check`, `METAL=1`, token-exact tiny oracle) | ✅ |
+| M1 — `colibri-lora-v1` adapter format + inference application | ✅ |
+| M2 — toy frozen-int4 linear + LoRA trainer, gradients vs PyTorch float64 | ✅ |
+| M3 — full-block training forward/backward on the tiny GLM oracle | 🚧 in progress |
+| M4–M9 — checkpointed backward, streamed-expert training, Metal kernels, real 64 GB run | ⏳ |
+
+**What exists so far**
+
+- [`c/lora.h`](c/lora.h) — adapter runtime: safetensors-based `colibri-lora-v1`
+  format, fingerprint-checked loader (`LORA_UNSAFE=1` to override), atomic
+  writer, CPU residual application. Inference picks adapters up via
+  `ADAPTER=<dir>`; without one, output is bit-identical to upstream.
+- [`c/train/qlora_ops.h`](c/train/qlora_ops.h) — QLoRA backward primitives,
+  including the streaming quantized-transpose `dx = Q(W)ᵀ dy` (never
+  materializes a dequantized matrix). Validated against PyTorch float64
+  autograd in `make check` ([`c/tests/test_train_linear.c`](c/tests/test_train_linear.c)).
+- [`c/train/train_model.h`](c/train/train_model.h) — WIP: manual backward
+  through the full GLM block (RMSNorm, RoPE, MLA attention, SwiGLU, frozen
+  top-k routing with differentiable gate values).
+- [`c/tools/make_lora_adapter.py`](c/tools/make_lora_adapter.py) /
+  [`c/tools/make_train_oracle.py`](c/tools/make_train_oracle.py) — adapter
+  generator and PyTorch training ground truth (losses, gradients, AdamW
+  trajectory) for the tiny-model oracle.
+
+**Try it on the tiny oracle model** (no big download; needs a venv with
+`torch`/`transformers` only for generation and ground truth):
+
+```bash
+cd c && make glm METAL=1
+python3 tools/make_glm_oracle.py                 # tiny GLM + reference
+SNAP=./glm_tiny TF=1 ./glm 64 16 16             # baseline: expect 32/32
+
+python3 tools/make_lora_adapter.py --model ./glm_tiny --out /tmp/ad0 --init zero
+ADAPTER=/tmp/ad0 SNAP=./glm_tiny TF=1 ./glm 64 16 16   # identity: still 32/32
+
+python3 tools/make_lora_adapter.py --model ./glm_tiny --out /tmp/adr --init random
+ADAPTER=/tmp/adr SNAP=./glm_tiny TF=1 ./glm 64 16 16   # adapter changes logits
+```
+
+Nothing in the fork weakens upstream guarantees: the default build has no new
+dependencies, training code is compiled separately, and `make check` must stay
+green with adapters disabled.
 
 
 ## See it running

@@ -107,37 +107,52 @@ typedef struct {
     float *eg,*eu,*eout;         /* [T,K,mi] [T,K,mi] [T,K,D] */
 } TTLayer;
 
+/* streamed-expert cache slot: (layer,eid) -> f32 QTs, LRU-evicted (M5) */
+typedef struct { int layer,eid,valid; uint64_t last; QT w[3]; } TTESlot;
+
 typedef struct {
     Model *m; LoraAdapter *lora;
     int T,D,H,qh,vh,nope,kvl,R,E,K,mi;
     int ckpt;                    /* 1 = M4 checkpointed mode */
     TTLayer *L;
     TTLayer scratch;             /* shared recompute stash (ckpt=1) */
-    QT (*expw)[3];               /* routed expert weights f32: [layer*E+e][g,u,d] */
     float *x;                    /* [T,D] residual stream (final state after fwd) */
     float *fn;                   /* [T,D] final rmsnorm out */
     float *logits;               /* [T,V] */
     float loss;
     float **dA,**dB;             /* adapter grads, indexed like lora->t */
     int64_t bytes_stash;         /* retained activation bytes (accounting) */
+    /* M5: streamed routed experts — never fully resident, loaded per layer
+     * DEDUPLICATED across the micro-batch, cached under a slot budget. */
+    TTESlot *ec; int ecap;
+    uint64_t ec_clock, ec_loads, ec_hits;    /* honest I/O counters */
+    int64_t  ec_bytes;                       /* bytes read from the snapshot */
+    double   ec_time;                        /* seconds spent loading */
 } TT;
 
-static void tt_load_experts(TT *tt){
-    Model *m=tt->m; Cfg *c=&m->c;
-    tt->expw=calloc((size_t)c->n_layers*tt->E,sizeof(*tt->expw));
-    for(int li=0;li<c->n_layers;li++){
-        if(!m->L[li].sparse) continue;
-        for(int e=0;e<tt->E;e++){
-            char nm[256]; QT *w=tt->expw[li*tt->E+e];
-            static const char *suf[3]={"gate_proj","up_proj","down_proj"};
-            int Os[3]={tt->mi,tt->mi,tt->D}, Is[3]={tt->D,tt->D,tt->mi};
-            for(int k=0;k<3;k++){
-                snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s.weight",li,e,suf[k]);
-                memset(&w[k],0,sizeof(QT));
-                qt_from_disk(m,nm,Os[k],Is[k],16,0,&w[k]);
-            }
-        }
+/* fetch expert weights, loading from the snapshot on miss (drop=1: streaming —
+ * the page cache is told not to keep the data; the slot cache is the budget). */
+static QT *ttec_get(TT *tt, int layer, int eid){
+    TTESlot *lru=&tt->ec[0];
+    for(int i=0;i<tt->ecap;i++){
+        TTESlot *s=&tt->ec[i];
+        if(s->valid&&s->layer==layer&&s->eid==eid){
+            s->last=++tt->ec_clock; tt->ec_hits++; return s->w; }
+        if(!s->valid){ if(lru->valid) lru=s; }
+        else if(lru->valid&&s->last<lru->last) lru=s;
     }
+    double t0=now_s();
+    static const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    int Os[3]={tt->mi,tt->mi,tt->D}, Is[3]={tt->D,tt->D,tt->mi};
+    char nm[256];
+    for(int k=0;k<3;k++){
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+        qt_from_disk(tt->m,nm,Os[k],Is[k],16,1,&lru->w[k]);
+        tt->ec_bytes+=st_nbytes(&tt->m->S,nm);
+    }
+    lru->valid=1; lru->layer=layer; lru->eid=eid; lru->last=++tt->ec_clock;
+    tt->ec_loads++; tt->ec_time+=now_s()-t0;
+    return lru->w;
 }
 
 /* allocate the recomputable fields of one stash; sized for the WORST layer so a
@@ -163,7 +178,7 @@ static int64_t tt_alloc_recompute(TT *tt, TTLayer *s, int any_sparse, int any_lo
     return b;
 }
 
-static TT *tt_init(Model *m, LoraAdapter *lora, int T, int ckpt){
+static TT *tt_init(Model *m, LoraAdapter *lora, int T, int ckpt, int ecap){
     TT *tt=calloc(1,sizeof(TT));
     Cfg *c=&m->c;
     tt->m=m; tt->lora=lora; tt->T=T; tt->D=c->hidden; tt->H=c->n_heads;
@@ -197,7 +212,8 @@ static TT *tt_init(Model *m, LoraAdapter *lora, int T, int ckpt){
         tt->dA[i]=falloc((int64_t)lora->rank*lora->t[i].I);
         tt->dB[i]=falloc((int64_t)lora->t[i].O*lora->rank);
     }
-    tt_load_experts(tt);
+    if(ecap<1) ecap=1;
+    tt->ecap=ecap; tt->ec=calloc(ecap,sizeof(TTESlot));
     return tt;
 }
 
@@ -282,10 +298,19 @@ static void tt_layer_forward(TT *tt, int li, TTLayer *s, float *x_out, int repla
             float sm=0; for(int kk=0;kk<K;kk++) sm+=pp[kk];
             for(int kk=0;kk<K;kk++)
                 w[kk]=(c->norm_topk ? pp[kk]/(sm+1e-20f) : pp[kk])*c->routed_scale;
-            for(int kk=0;kk<K;kk++){
-                QT *ew=tt->expw[li*tt->E+idx[kk]];
+        }
+    }
+    /* routed experts, GROUPED BY EXPERT across the whole micro-batch: each
+     * needed expert is fetched ONCE per layer pass and applied to every row
+     * routed to it (AGENTS.md §10 — never load per token). */
+    if(l->sparse) for(int e=0;e<tt->E;e++){
+        QT *ew=NULL;
+        for(int t=0;t<T;t++){
+            const int *idx=s->eidx+(int64_t)t*K; const float *w=s->ew+(int64_t)t*K;
+            for(int kk=0;kk<K;kk++) if(idx[kk]==e){
+                if(!ew) ew=ttec_get(tt,li,e);
                 float *eo=s->eout+((int64_t)t*K+kk)*D;
-                tt_swiglu_fwd(&ew[0],&ew[1],&ew[2],n2,
+                tt_swiglu_fwd(&ew[0],&ew[1],&ew[2],s->nrm2+(int64_t)t*D,
                               s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,eo);
                 if(x_out) for(int d=0;d<D;d++) x_out[(int64_t)t*D+d]+=w[kk]*eo[d];
             }
@@ -311,17 +336,13 @@ static void tt_layer_backward(TT *tt, int li, TTLayer *s, float *dx){
             int N=mi*c->n_shared;
             tt_swiglu_bwd(&l->sh_gate,&l->sh_up,&l->sh_down,
                           s->g+(int64_t)t*N,s->u+(int64_t)t*N,dy,dn2+(int64_t)t*D);
-            const int *idx=s->eidx+(int64_t)t*K; const float *w=s->ew+(int64_t)t*K, *pp=s->ep+(int64_t)t*K;
-            float dwl[64], deo[4096];
+            /* dL/dw_k needs only the STASHED expert outputs — no expert weights */
+            const int *idx=s->eidx+(int64_t)t*K; const float *pp=s->ep+(int64_t)t*K;
+            float dwl[64];
             for(int kk=0;kk<K;kk++){
-                QT *ew=tt->expw[li*tt->E+idx[kk]];
                 const float *eo=s->eout+((int64_t)t*K+kk)*D;
                 double a=0; for(int d=0;d<D;d++) a+=(double)eo[d]*dy[d];
-                dwl[kk]=(float)a;                     /* dL/dw_k */
-                for(int d=0;d<D;d++) deo[d]=w[kk]*dy[d];
-                tt_swiglu_bwd(&ew[0],&ew[1],&ew[2],
-                              s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,
-                              deo,dn2+(int64_t)t*D);
+                dwl[kk]=(float)a;
             }
             /* through gate values: w_k = scale * p_k / sum(p) (norm_topk) */
             float dp[64];
@@ -337,9 +358,27 @@ static void tt_layer_backward(TT *tt, int li, TTLayer *s, float *dx){
                 for(int d=0;d<D;d++) dn2[(int64_t)t*D+d]+=dl*rr[d];
             }
         }
-        /* post_ln backward; residual passthrough keeps dx as-is */
-        tt_rmsnorm_bwd(s->x_mid+(int64_t)t*D,l->post_ln,dn2+(int64_t)t*D,dx+(int64_t)t*D,D,c->eps);
     }
+    /* routed expert backward, GROUPED BY EXPERT (one fetch per needed expert
+     * per layer pass — the backward reload is counted by the same I/O metrics,
+     * never hidden). Frozen experts receive dX only, no dW exists anywhere. */
+    if(l->sparse) for(int e=0;e<tt->E;e++){
+        QT *ew=NULL; float deo[4096];
+        for(int t=0;t<T;t++){
+            const int *idx=s->eidx+(int64_t)t*K; const float *w=s->ew+(int64_t)t*K;
+            const float *dy=dx+(int64_t)t*D;
+            for(int kk=0;kk<K;kk++) if(idx[kk]==e){
+                if(!ew) ew=ttec_get(tt,li,e);
+                for(int d=0;d<D;d++) deo[d]=w[kk]*dy[d];
+                tt_swiglu_bwd(&ew[0],&ew[1],&ew[2],
+                              s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,
+                              deo,dn2+(int64_t)t*D);
+            }
+        }
+    }
+    /* post_ln backward; residual passthrough keeps dx as-is */
+    for(int t=0;t<T;t++)
+        tt_rmsnorm_bwd(s->x_mid+(int64_t)t*D,l->post_ln,dn2+(int64_t)t*D,dx+(int64_t)t*D,D,c->eps);
     free(dn2);
     /* ---- attention backward: dx holds dL/d(x after attn add) ---- */
     float *dctx=falloc((int64_t)T*H*vh); memset(dctx,0,(int64_t)T*H*vh*sizeof(float));

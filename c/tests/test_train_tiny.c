@@ -67,7 +67,7 @@ int main(void){
     int steps=(int)jreq(J,"steps")->num;
     float lr=(float)jreq(J,"lr")->num;
 
-    TT *tt=tt_init(&M,lora,T,0);
+    TT *tt=tt_init(&M,lora,T,0,16);   /* cache fits every expert */
 
     /* 1) forward loss parity */
     float loss0=(float)jreq(J,"loss0")->num;
@@ -97,7 +97,7 @@ int main(void){
     /* 2b) M4: activation-checkpointed mode — same loss, same gradients (the
      * recompute replays routing through the same kernels in the same order, so
      * parity should be essentially bitwise), with O(1-layer) stash memory. */
-    TT *tc=tt_init(&M,lora,T,1);
+    TT *tc=tt_init(&M,lora,T,1,4);    /* cap 4 < 8 experts/layer: forces real streaming */
     float lck=tt_forward(tc,tok);
     CHECK(fabsf(lck-loss)<=1e-7f);
     tt_backward(tc,tok);
@@ -112,6 +112,19 @@ int main(void){
            cmax,tc->bytes_stash/1048576.0,tt->bytes_stash/1048576.0);
     CHECK(cmax<1e-6f);
     CHECK(tc->bytes_stash*2<tt->bytes_stash);   /* bounded: ~1 layer + checkpoints */
+
+    /* 2c) M5: streamed experts — deduplicated layer-wise loads, honest I/O.
+     * 2 sparse layers x 8 experts = 16 unique (layer,expert) pairs max; without
+     * dedup a fwd+bwd pass would issue >= 2*2*T*K = 256 loads. The 4-slot
+     * trainer must evict and reload (loads > uniques) yet match bitwise. */
+    printf("expert I/O: retained(cap16) %llu loads %llu hits | ckpt(cap4) %llu loads %llu hits | %.2f MB read\n",
+           (unsigned long long)tt->ec_loads,(unsigned long long)tt->ec_hits,
+           (unsigned long long)tc->ec_loads,(unsigned long long)tc->ec_hits,
+           (tt->ec_bytes+tc->ec_bytes)/1048576.0);
+    CHECK(tt->ec_loads<=16);                    /* one load per unique expert */
+    CHECK(tt->ec_hits>0);                       /* backward reuses the cache */
+    CHECK(tc->ec_loads>tt->ec_loads);           /* small cache streams (evicts+reloads) */
+    CHECK(tc->ec_bytes>0);
 
     /* 3) AdamW trajectory + final adapter tensors — run in CHECKPOINTED mode:
      * training end-to-end must work with recompute, not just one backward. */

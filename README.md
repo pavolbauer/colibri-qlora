@@ -44,8 +44,9 @@ failure. The full design, memory model, and milestone gates are in
 | M2 — toy frozen-int4 linear + LoRA trainer, gradients vs PyTorch float64 | ✅ |
 | M3 — full-block training forward/backward on the tiny GLM oracle, gradients + AdamW trajectory vs PyTorch | ✅ |
 | M4 — activation-checkpointed backward: recompute parity bitwise, stash O(1 layer) | ✅ |
-| M5 — streamed-expert backward/recompute | 🚧 next |
-| M6–M9 — Metal training kernels, real 64 GB run, overfit proof | ⏳ |
+| M5 — streamed-expert training: LRU budget, layer-deduplicated loads, I/O metrics | ✅ |
+| M6 — Metal training kernels | 🚧 next |
+| M7–M9 — real GLM-5.2 64 GB smoke test, overfit proof, throughput | ⏳ |
 
 **What exists so far**
 

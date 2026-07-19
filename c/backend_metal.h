@@ -91,14 +91,15 @@ int coli_metal_gemm(float *y, const float *x, const void *weights, const float *
  * success, 0 -> caller must run the CPU path.
  *
  *   train_tmul:      dx[S,I] += dequant(W[O,I])^T dy[S,O]  (fmt 0=f32 no-scale,
- *                    1=int8, 2=int4 packed; per-row scales; the dequantized
- *                    matrix is never materialized)
+ *                    1=int8, 2=int4 per-row scale, 4=int4 grouped — gs columns
+ *                    per scale, scale[o*ng+i/gs]; the dequantized matrix is
+ *                    never materialized. gs ignored unless fmt=4)
  *   train_lora_fwd:  z = x A^T ; y += scale * z B^T        (f32, z cached for bwd)
  *   train_lora_bwd:  dz = scale * dy B ; dB += scale * dy^T z ; dA += dz^T x ;
  *                    dx += dz A  (dx may be NULL to skip)
  */
 int coli_metal_train_tmul(float *dx, const float *dy, const void *weights, const float *scales,
-                          int fmt, int S, int I, int O);
+                          int fmt, int gs, int S, int I, int O);
 int coli_metal_train_lora_fwd(float *y, float *z, const float *x,
                               const float *A, const float *B, float scale,
                               int S, int I, int O, int rank);

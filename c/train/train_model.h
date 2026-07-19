@@ -119,7 +119,7 @@ typedef struct {
     float *x;                    /* [T,D] residual stream (final state after fwd) */
     float *fn;                   /* [T,D] final rmsnorm out */
     float *logits;               /* [T,V] */
-    float loss;
+    float loss; int loss_np;     /* CE positions in the last forward */
     float **dA,**dB;             /* adapter grads, indexed like lora->t */
     int64_t bytes_stash;         /* retained activation bytes (accounting) */
     /* M5: streamed routed experts — never fully resident, loaded per layer
@@ -442,8 +442,10 @@ static void tt_layer_backward(TT *tt, int li, TTLayer *s, float *dx){
     free(dn1); free(dq); free(dkvb); free(dkr); free(dctx);
 }
 
-/* ---------- full forward ---------- */
-static float tt_forward(TT *tt, const int *tok){
+/* ---------- full forward ----------
+ * msk: per-token loss mask (coli-sft-v1 semantics — position t contributes
+ * iff msk[t+1]==1), NULL = every next-token position counts. */
+static float tt_forward_masked(TT *tt, const int *tok, const unsigned char *msk){
     Model *m=tt->m; Cfg *c=&m->c;
     int T=tt->T,D=tt->D;
     for(int t=0;t<T;t++) embed_row(m,tok[t],tt->x+(int64_t)t*D);
@@ -452,38 +454,44 @@ static float tt_forward(TT *tt, const int *tok){
         memcpy(s->x_in,tt->x,(int64_t)T*D*sizeof(float));
         tt_layer_forward(tt,li,s,tt->x,0);
     }
-    /* head + mean CE over positions 0..T-2 predicting tok[t+1] */
-    double lsum=0; int V=c->vocab, np=T-1;
+    /* head + mean CE over unmasked positions t predicting tok[t+1] */
+    double lsum=0; int V=c->vocab, np=0;
     for(int t=0;t<T;t++){
         rmsnorm(tt->fn+(int64_t)t*D,tt->x+(int64_t)t*D,m->final_norm,D,c->eps);
         matmul_qt(tt->logits+(int64_t)t*V,tt->fn+(int64_t)t*D,&m->lm_head,1);
     }
-    for(int t=0;t<np;t++){
+    for(int t=0;t<T-1;t++){
+        if(msk && !msk[t+1]) continue;
         const float *lo=tt->logits+(int64_t)t*V;
         double mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
         double se=0; for(int i=0;i<V;i++) se+=exp((double)lo[i]-mx);
         lsum += (mx+log(se)) - (double)lo[tok[t+1]];
+        np++;
     }
-    tt->loss=(float)(lsum/np);
+    tt->loss_np=np;
+    tt->loss = np ? (float)(lsum/np) : 0.f;
     return tt->loss;
 }
+static float tt_forward(TT *tt, const int *tok){ return tt_forward_masked(tt,tok,NULL); }
 
 /* ---------- full backward ----------
  * ckpt=0: every layer's stash is still valid from tt_forward.
  * ckpt=1: only x_in + routing ids survived; recompute the layer stash
  * (routing replayed) right before its backward — memory stays O(1 layer). */
-static void tt_backward(TT *tt, const int *tok){
+static void tt_backward_masked(TT *tt, const int *tok, const unsigned char *msk){
     Model *m=tt->m; Cfg *c=&m->c;
-    int T=tt->T,D=tt->D,V=c->vocab,np=T-1;
+    int T=tt->T,D=tt->D,V=c->vocab,np=tt->loss_np;
+    if(!np) return;
     for(int i=0;i<tt->lora->n;i++){
         memset(tt->dA[i],0,(size_t)tt->lora->rank*tt->lora->t[i].I*sizeof(float));
         memset(tt->dB[i],0,(size_t)tt->lora->t[i].O*tt->lora->rank*sizeof(float));
     }
     float *dx=falloc((int64_t)T*D); memset(dx,0,(int64_t)T*D*sizeof(float));
-    /* CE + lm_head + final norm */
+    /* CE + lm_head + final norm (np = unmasked positions from the forward) */
     {
         float *dlog=falloc(V), *dfn=falloc(D);
-        for(int t=0;t<np;t++){
+        for(int t=0;t<T-1;t++){
+            if(msk && !msk[t+1]) continue;
             const float *lo=tt->logits+(int64_t)t*V;
             double mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
             double se=0; for(int i=0;i<V;i++) se+=exp((double)lo[i]-mx);
@@ -502,5 +510,6 @@ static void tt_backward(TT *tt, const int *tok){
     }
     free(dx);
 }
+static void tt_backward(TT *tt, const int *tok){ tt_backward_masked(tt,tok,NULL); }
 
 #endif /* TRAIN_MODEL_H */

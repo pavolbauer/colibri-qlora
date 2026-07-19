@@ -193,6 +193,33 @@ int main(void){
     fprintf(stderr,"overfit: loss %.4f -> %.4f (%d steps)\n",loss0,lossN,300);
     CHECK(lossN < loss0/5.f);
 
+    /* --- fmt=4 (grouped int4, real-snapshot layout): train_qt_bwd_dx vs a
+     * dequantized f64 reference. gs=16 with I=32 -> 2 groups per row, distinct
+     * scales, so a per-row-scale bug cannot pass. --- */
+    {
+        const int GS=16, NG=(I+GS-1)/GS, RB=(I+1)/2;
+        QT g; memset(&g,0,sizeof(g));
+        g.fmt=4; g.O=O; g.I=I; g.gs=GS;
+        g.q4=malloc((size_t)O*RB); g.s=falloc((int64_t)O*NG);
+        for(int i=0;i<O*RB;i++) g.q4[i]=(uint8_t)(xr()&0xFF);
+        for(int i=0;i<O*NG;i++) g.s[i]=0.01f+0.005f*(float)(xr()%100);
+        float gdy[S*O], gdx[S*I]; double ref[S*I];
+        for(int i=0;i<S*O;i++) gdy[i]=fr();
+        for(int i=0;i<S*I;i++){ gdx[i]=fr(); ref[i]=gdx[i]; }
+        for(int s=0;s<S;s++) for(int o=0;o<O;o++){
+            double c=gdy[(int64_t)s*O+o];
+            for(int i=0;i<I;i++){
+                uint8_t b=g.q4[(int64_t)o*RB+(i>>1)];
+                int v=(i&1)?((int)(b>>4)-8):((int)(b&0xF)-8);
+                ref[(int64_t)s*I+i]+=c*(double)v*(double)g.s[(int64_t)o*NG+i/GS];
+            }
+        }
+        train_qt_bwd_dx(&g,gdy,gdx,S);
+        for(int i=0;i<S*I;i++) CHECK(relerr(gdx[i],ref[i])<1e-4);
+        fprintf(stderr,"fmt=4 grouped transpose backward: ok\n");
+        free(g.q4); free(g.s);
+    }
+
     puts("toy frozen-int4 + LoRA trainer tests: ok");
     return 0;
 }

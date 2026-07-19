@@ -38,6 +38,20 @@ static void train_qt_bwd_dx(const QT *w, const float *dy, float *dx, int S){
                     if(i+1<I) dxs[i+1]+=c*(float)((int)(b>>4)-8);
                 }
             }
+        } else if(w->fmt==4){
+            /* grouped int4: per-row scale per gs-column group (real GLM-5.2
+             * snapshot layout). gs is a multiple of 16 (detect_group_size), so
+             * a nibble pair never straddles a group; both lookups kept anyway. */
+            int rb=(I+1)/2, gs=w->gs, ng=(I+gs-1)/gs;
+            for(int o=0;o<O;o++){ float c=dys[o];
+                if(c==0) continue;
+                const uint8_t *qr=w->q4+(int64_t)o*rb;
+                const float *scl=w->s+(int64_t)o*ng;
+                for(int i=0;i<I;i+=2){ uint8_t b=qr[i>>1];
+                    dxs[i]+=c*scl[i/gs]*(float)((int)(b&0xF)-8);
+                    if(i+1<I) dxs[i+1]+=c*scl[(i+1)/gs]*(float)((int)(b>>4)-8);
+                }
+            }
         } else { fprintf(stderr,"train_qt_bwd_dx: fmt=%d not supported\n",w->fmt); exit(1); }
     }
 }

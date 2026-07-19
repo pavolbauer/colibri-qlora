@@ -181,15 +181,17 @@ static int run_attn(int S, int pos_base, const char* name){
 static float frand01(){ return ((rand()%2000)-1000)/1000.f; }
 
 // dx += dequant(W)^T dy, reference in double
-static int run_train_tmul(int fmt, int O, int I, int S, const char *name){
+static int run_train_tmul(int fmt, int O, int I, int S, int gs, const char *name){
   srand(1234);
   int rb4=(I+1)/2;
-  size_t wn = (fmt==I8)?(size_t)O*I : (fmt==I4)?(size_t)O*rb4 : (size_t)O*I*4;
+  int G4=4;                                  // fmt code for grouped int4
+  int ng=(gs>0)?(I+gs-1)/gs:1;
+  size_t wn = (fmt==I8)?(size_t)O*I : (fmt==I4||fmt==G4)?(size_t)O*rb4 : (size_t)O*I*4;
   std::vector<uint8_t> W(wn); std::vector<float> Wf;
   if (fmt==F32){ Wf.resize((size_t)O*I); for(auto&v:Wf) v=frand01(); }
   else for(auto&b:W) b=(uint8_t)((fmt==I8)?((rand()%255)-127):(rand()&0xFF));
   const void *Wp=(fmt==F32)?(const void*)Wf.data():(const void*)W.data();
-  std::vector<float> s(O), dy((size_t)S*O), dx0((size_t)S*I);
+  std::vector<float> s((fmt==G4)?(size_t)O*ng:(size_t)O), dy((size_t)S*O), dx0((size_t)S*I);
   for(auto&v:s) v=0.01f+(rand()%100)/10000.f;
   for(auto&v:dy) v=frand01();
   for(auto&v:dx0) v=frand01();
@@ -200,12 +202,13 @@ static int run_train_tmul(int fmt, int O, int I, int S, const char *name){
       double w;
       if(fmt==I8) w=(double)(int8_t)W[(size_t)o*I+i]*s[o];
       else if(fmt==I4){ uint8_t b=W[(size_t)o*rb4+(i>>1)]; int v=(i&1)?(b>>4):(b&0xF); w=(double)(v-8)*s[o]; }
+      else if(fmt==G4){ uint8_t b=W[(size_t)o*rb4+(i>>1)]; int v=(i&1)?(b>>4):(b&0xF); w=(double)(v-8)*s[(size_t)o*ng+i/gs]; }
       else w=Wf[(size_t)o*I+i];
       ref[(size_t)si*I+i]+=w*d;
     }
   }
   std::vector<float> dxg(dx0);
-  if(!coli_metal_train_tmul(dxg.data(),dy.data(),Wp,s.data(),fmt,S,I,O)){
+  if(!coli_metal_train_tmul(dxg.data(),dy.data(),Wp,s.data(),fmt,gs,S,I,O)){
     printf("  %-24s FAIL (returned 0)\n",name); return 1; }
   double ma=0,ym=0;
   for(size_t i=0;i<ref.size();i++){ ma=fmax(ma,fabs(dxg[i]-ref[i])); ym=fmax(ym,fabs(ref[i])); }
@@ -304,11 +307,14 @@ int main(void) {
   fail |= run_attn(4, 12,  "attn S=4 pos=12 (MTP)");
   fail |= run_attn(3, 0,   "attn S=3 pos=0");
   printf("Metal training kernel tests (M6):\n");
-  fail |= run_train_tmul(I8, 2048,6144,1, "tmul int8 S=1");
-  fail |= run_train_tmul(I4, 2048,6144,1, "tmul int4 S=1");
-  fail |= run_train_tmul(I4, 6144,2048,4, "tmul int4 down S=4");
-  fail |= run_train_tmul(I4, 2050,6146,3, "tmul int4 odd dims");
-  fail |= run_train_tmul(F32,1024,2048,2, "tmul f32 S=2");
+  fail |= run_train_tmul(I8, 2048,6144,1,0,  "tmul int8 S=1");
+  fail |= run_train_tmul(I4, 2048,6144,1,0,  "tmul int4 S=1");
+  fail |= run_train_tmul(I4, 6144,2048,4,0,  "tmul int4 down S=4");
+  fail |= run_train_tmul(I4, 2050,6146,3,0,  "tmul int4 odd dims");
+  fail |= run_train_tmul(F32,1024,2048,2,0,  "tmul f32 S=2");
+  fail |= run_train_tmul(4,  2048,6144,2,128,"tmul int4 g128 S=2");
+  fail |= run_train_tmul(4,  6144,2048,1,64, "tmul int4 g64 S=1");
+  fail |= run_train_tmul(4,  1024,2050,3,32, "tmul int4 g32 odd I");
   fail |= run_train_lora(4, 8192,6144,8,  "lora r=8 S=4");
   fail |= run_train_lora(1, 6144,6144,4,  "lora r=4 S=1");
   fail |= run_train_lora(7, 2048,1024,32, "lora r=32 S=7 (odd)");

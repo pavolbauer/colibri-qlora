@@ -46,7 +46,8 @@ failure. The full design, memory model, and milestone gates are in
 | M4 — activation-checkpointed backward: recompute parity bitwise, stash O(1 layer) | ✅ |
 | M5 — streamed-expert training: LRU budget, layer-deduplicated loads, I/O metrics | ✅ |
 | M6 — Metal training kernels (quantized-transpose dX, LoRA fwd/bwd) with CPU parity | ✅ |
-| M7 — real GLM-5.2 64 GB smoke test | 🚧 next (needs the ~370 GB int4 snapshot on NVMe) |
+| Pre-M7 — grouped-int4 backward, memory budget manager, `coli_train` CLI, SFT dataset pipeline, checkpoint/resume (bitwise A/B acceptance) | ✅ |
+| M7 — real GLM-5.2 64 GB smoke test | 🚧 next (needs the 384 GB int4 snapshot downloaded — see docs/plans runbook) |
 | M8–M9 — overfit proof, throughput/practical training | ⏳ |
 
 **What exists so far**

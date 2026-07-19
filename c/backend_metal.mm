@@ -229,6 +229,7 @@ kernel void t_tmul(device const uchar* w      [[buffer(0)]],
                    device float*       dx     [[buffer(3)]],   // [S,I] accumulate
                    constant int& S [[buffer(4)]], constant int& I [[buffer(5)]],
                    constant int& O [[buffer(6)]], constant int& fmt [[buffer(7)]],
+                   constant int& gs [[buffer(8)]],             // fmt=4 group size
                    uint gid [[thread_position_in_grid]]) {
   if (gid >= (uint)(S*I)) return;
   int i = gid % I, s = gid / I;
@@ -242,6 +243,12 @@ kernel void t_tmul(device const uchar* w      [[buffer(0)]],
     for (int o = 0; o < O; o++) {
       int v = (w[(long)o*rb + (i>>1)] >> sh) & 0xF;
       acc += float(v-8) * scale[o] * dyr[o];
+    }
+  } else if (fmt == 4) {                            // grouped int4: scale[o*ng + i/gs]
+    int rb = (I+1)/2, sh = (i&1)*4, ng = (I+gs-1)/gs, gi = i/gs;
+    for (int o = 0; o < O; o++) {
+      int v = (w[(long)o*rb + (i>>1)] >> sh) & 0xF;
+      acc += float(v-8) * scale[(long)o*ng + gi] * dyr[o];
     }
   } else {                                          // f32 (no scale)
     device const float* wf = (device const float*)w;
@@ -732,12 +739,14 @@ extern "C" int coli_metal_gemm(float *y, const float *x, const void *wp, const f
 // accumulate outputs are copied in, updated on GPU, copied back.
 
 extern "C" int coli_metal_train_tmul(float *dx, const float *dy, const void *w, const float *sp,
-                                     int fmt, int S, int I, int O) {
-  if (!g_dev || !g_t_tmul || (fmt!=0 && fmt!=1 && fmt!=2)) return 0;
+                                     int fmt, int gs, int S, int I, int O) {
+  if (!g_dev || !g_t_tmul || (fmt!=0 && fmt!=1 && fmt!=2 && fmt!=4)) return 0;
+  if (fmt==4 && gs<1) return 0;
   @autoreleasepool {
-    size_t wbytes = (fmt==1)?(size_t)O*I : (fmt==2)?(size_t)O*((I+1)/2) : (size_t)O*I*4;
+    size_t wbytes = (fmt==1)?(size_t)O*I : (fmt==2||fmt==4)?(size_t)O*((I+1)/2) : (size_t)O*I*4;
+    size_t sbytes = (fmt==4)?(size_t)O*((I+gs-1)/gs)*4 : (size_t)O*4;
     id<MTLBuffer> wb=wrap(w,wbytes);
-    id<MTLBuffer> sb=wrap(sp?sp:(const void*)dx, sp?(size_t)O*4:4);   /* fmt0: unused, bind dummy */
+    id<MTLBuffer> sb=wrap(sp?sp:(const void*)dx, sp?sbytes:4);   /* fmt0: unused, bind dummy */
     id<MTLBuffer> dyb=wrap(dy,(size_t)S*O*4);
     id<MTLBuffer> dxb=[g_dev newBufferWithBytes:dx length:(size_t)S*I*4 options:MTLResourceStorageModeShared];
     if(!wb||!sb||!dyb||!dxb) return 0;
@@ -747,6 +756,7 @@ extern "C" int coli_metal_train_tmul(float *dx, const float *dy, const void *w, 
     [e setBuffer:dyb offset:0 atIndex:2]; [e setBuffer:dxb offset:0 atIndex:3];
     [e setBytes:&S length:4 atIndex:4]; [e setBytes:&I length:4 atIndex:5];
     [e setBytes:&O length:4 atIndex:6]; [e setBytes:&fmt length:4 atIndex:7];
+    [e setBytes:&gs length:4 atIndex:8];
     size_t n=(size_t)S*I;
     [e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];

@@ -133,6 +133,11 @@ int main(int argc, char **argv){
 
     TDataset ds;
     if(tds_open(&ds,data,"train",seq,seed)) return 1;
+    for(int64_t i=0;i<ds.n_tok;i++) if(ds.tok[i]>=(uint32_t)c->vocab){
+        fprintf(stderr,"[data] token id %u at %lld >= model vocab %d — dataset was "
+                       "tokenized for a different model\n",ds.tok[i],(long long)i,c->vocab);
+        return 1;
+    }
 
     AdamW opt=adamw_default(lr);
     float **sm=calloc(lora->n*2,sizeof(float*)), **sv=calloc(lora->n*2,sizeof(float*));

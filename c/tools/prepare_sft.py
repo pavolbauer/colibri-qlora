@@ -68,6 +68,11 @@ else:
             for i, m in enumerate(msgs):
                 upto = tk.apply_chat_template(msgs[:i+1], tokenize=True,
                                               add_generation_prompt=False)
+                if not isinstance(upto, list):        # transformers v5 BatchEncoding
+                    upto = upto["input_ids"]
+                if upto[:len(ids)] != ids:
+                    raise SystemExit(f"line {ln}: chat template is not prefix-stable, "
+                                     "cannot mask incrementally")
                 new = upto[len(ids):]
                 ids = upto
                 mask += [1 if m["role"] == "assistant" else 0] * len(new)

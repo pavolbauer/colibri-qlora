@@ -10,6 +10,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# stage timing: printed after every stage and summed at the end
+T_START=$EPOCHSECONDS; T_LAST=$EPOCHSECONDS
+stamp() { local now=$EPOCHSECONDS
+  echo "⏱  [$1] took $((now-T_LAST))s (elapsed total $((now-T_START))s)"; T_LAST=$now; }
+
 MODEL="${COLI_MODEL:-$HOME/Work/models/glm52_i4}"
 OUT="${ADAPTER_OUT:-adapters/m7-smoke}"
 RAM="${RAM:-36}"   # conservative default: leaves room for your apps + macOS file cache; raise to 52 on a dedicated run
@@ -20,13 +25,19 @@ echo "== stage 0: build =="
 make glm METAL=1
 make coli_train
 
+stamp "stage 0: build"
+
 echo "== stage 0b: read-only readiness =="
 COLI_MODEL="$MODEL" ./coli doctor || echo "(doctor warnings above — review before continuing)"
+
+stamp "stage 0b: doctor"
 
 echo "== stage 1: ONE full training step (fwd + bwd + optimizer) =="
 ./coli_train --model "$MODEL" --data data/m8_tokenized --adapter-out "$OUT" \
   --ram "$RAM" --seq-len 128 --grad-accum 1 --rank 4 --alpha 8 \
   --lr 1e-4 --steps 1 --save-every 1 --seed 0
+
+stamp "stage 1: single step"
 
 echo "== stage 2: 10 steps with gradient accumulation (resumes stage 1) =="
 ./coli_train --model "$MODEL" --data data/m8_tokenized --adapter-out "$OUT" \
@@ -34,10 +45,13 @@ echo "== stage 2: 10 steps with gradient accumulation (resumes stage 1) =="
   --ram "$RAM" --seq-len 128 --grad-accum 4 --rank 4 --alpha 8 \
   --lr 1e-4 --steps 10 --save-every 5 --seed 0
 
+stamp "stage 2: 10 steps"
+
 echo "== stage 3: adapter loads in inference (M7 success criterion) =="
 PROMPT="$(cat data/m8_eval/who.txt)"
 echo "--- with adapter ---"
 ADAPTER="$OUT" SNAP="$MODEL" PROMPT="$PROMPT" NGEN=48 TEMP=0 ./glm 64
+stamp "stage 3: inference eval"
 echo ""
 echo "== M7 smoke complete. Checklist (AGENTS.md §16/§27):"
 echo "   - every [step] line finite loss?          (scroll up)"

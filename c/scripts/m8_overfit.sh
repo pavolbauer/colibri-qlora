@@ -12,6 +12,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+T_START=$EPOCHSECONDS; T_LAST=$EPOCHSECONDS
+stamp() { local now=$EPOCHSECONDS
+  echo "⏱  [$1] took $((now-T_LAST))s (elapsed total $((now-T_START))s)"; T_LAST=$now; }
+
 MODEL="${COLI_MODEL:-$HOME/Work/models/glm52_i4}"
 OUT="${ADAPTER_OUT:-adapters/m8-persona}"
 RAM="${RAM:-52}"
@@ -30,6 +34,8 @@ echo "== training: $STEPS steps on data/m8_tokenized (rank 8, lr $LR) =="
   --ram "$RAM" --seq-len 128 --grad-accum 4 --rank 8 --alpha 16 \
   --lr "$LR" --steps "$STEPS" --save-every 50 --seed 0
 
+stamp "training ($STEPS steps)"
+
 echo ""
 echo "== eval: base vs adapter (greedy, 48 tokens) =="
 for f in data/m8_eval/*.txt; do
@@ -41,6 +47,7 @@ for f in data/m8_eval/*.txt; do
   echo ">> [$name] ADAPTER:"
   ADAPTER="$OUT" SNAP="$MODEL" PROMPT="$P" NGEN=48 TEMP=0 ./glm 64 2>/dev/null | tail -3
 done
+stamp "eval (all prompts, base+adapter)"
 echo "----------------------------------------------------------"
 echo "Expect: adapter answers terse, persona-shaped, ending with the bird."
 echo "Base answers must be unchanged (adapter off = base behavior, §16-M8)."

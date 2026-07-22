@@ -182,6 +182,7 @@ int main(int argc, char **argv){
 
     int *tok=malloc((seq+1)*sizeof(int));
     uint32_t *tok32=malloc((seq+1)*4); uint8_t *msk=malloc(seq+1);
+    int swap_strikes=0;
     int64_t ceiling=(int64_t)(56ll<<30)<bud.total?(56ll<<30):bud.total+(4ll<<30);
     double t_start=now_s();
 
@@ -227,11 +228,33 @@ int main(int argc, char **argv){
                 (long long)s+1,loss,lr,(long long)tok_sum,tok_sum/dt,dt,t_fwd,t_bwd,t_opt,
                 (unsigned long long)(tt->ec_loads-loads0),(unsigned long long)(tt->ec_hits-hits0),
                 (tt->ec_bytes-bytes0)/1048576.0,ds.epoch);
-        if(!isfinite(loss)){ fprintf(stderr,"[train] non-finite loss — aborting\n"); break; }
+        /* any abort below must not lose the step that just completed (§15) */
+        #define SAVE_NOW() do{ st.step=s+1; st.opt_t=opt.t; st.epoch=ds.epoch; st.cursor=ds.cursor; \
+            if(!tckpt_save(out,lora,&st,sm,sv)) \
+                fprintf(stderr,"[ckpt] saved %s @ step %lld (abort path)\n",out,(long long)s+1); }while(0)
+        if(!isfinite(loss)){ fprintf(stderr,"[train] non-finite loss — aborting\n"); SAVE_NOW(); break; }
         int viol=tbudget_violated(&bud,ceiling);
-        if(viol){ tbudget_log(&bud,stderr);
-            fprintf(stderr,"[train] budget violation (%s) — aborting per AGENTS.md §11\n",
-                    viol==1?"footprint over ceiling":"swap growth"); break; }
+        if(viol==1){ tbudget_log(&bud,stderr);
+            fprintf(stderr,"[train] footprint over hard ceiling — aborting per AGENTS.md §11\n");
+            SAVE_NOW(); break; }
+        if(viol==2){
+            /* system swap grew: §11 says the expert cache shrinks BEFORE the
+             * process leans on swap. Streaming 100s of GB also pressures the
+             * macOS file cache, which can page OTHER apps — so give memory
+             * back and continue; abort only when the cache has nothing left
+             * to give twice in a row. */
+            int64_t grew=tb_swap_used()-bud.swap_base;
+            int shed=ttec_shed(tt,grew+(1ll<<30));
+            bud.swap_base=tb_swap_used();
+            if(shed){ swap_strikes=0;
+                fprintf(stderr,"[mem] swap grew %+.0f MB — shed %d expert slots and continuing\n",
+                        grew/1048576.0,shed); }
+            else if(++swap_strikes>=2){ tbudget_log(&bud,stderr);
+                fprintf(stderr,"[train] swap keeps growing with an empty expert cache — aborting per §11\n");
+                SAVE_NOW(); break; }
+            else fprintf(stderr,"[mem] swap grew %+.0f MB with empty cache (strike 1/2) — continuing\n",
+                         grew/1048576.0);
+        } else swap_strikes=0;
         tbudget_log(&bud,stderr);   /* real-model steps are minutes: log every step */
         if(tt->ec_shrinks) fprintf(stderr,"[mem] cache shrinks so far: %llu slots\n",
                                    (unsigned long long)tt->ec_shrinks);

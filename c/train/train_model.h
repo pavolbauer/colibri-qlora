@@ -145,6 +145,21 @@ static void ttec_drop(TTESlot *s){
     s->valid=0;
 }
 
+/* shed ~`bytes` of expert cache (LRU-first). Returns slots dropped; 0 means
+ * the cache was already empty — the caller has nothing elastic left. */
+static int ttec_shed(TT *tt, int64_t bytes){
+    int dropped=0; int64_t freed=0;
+    int64_t per = tt->ec_loads ? tt->ec_bytes/(int64_t)tt->ec_loads : (16ll<<20);
+    while(freed<bytes){
+        TTESlot *old=NULL;
+        for(int i=0;i<tt->ecap;i++){ TTESlot *s=&tt->ec[i];
+            if(s->valid && (!old||s->last<old->last)) old=s; }
+        if(!old) break;
+        ttec_drop(old); dropped++; freed+=per; tt->ec_shrinks++;
+    }
+    return dropped;
+}
+
 /* fetch expert weights, loading from the snapshot on miss (drop=1: streaming —
  * the page cache is told not to keep the data; the slot cache is the budget). */
 static QT *ttec_get(TT *tt, int layer, int eid){

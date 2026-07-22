@@ -40,8 +40,10 @@ echo "== stage 1: ONE full training step (fwd + bwd + optimizer) =="
 stamp "stage 1: single step"
 
 echo "== stage 2: 10 steps with gradient accumulation (resumes stage 1) =="
+RESUME_ARGS=()
+[[ -f "$OUT/train_state.bin" ]] && RESUME_ARGS=(--resume "$OUT") || echo "(no stage-1 state — starting fresh)"
 ./coli_train --model "$MODEL" --data data/m8_tokenized --adapter-out "$OUT" \
-  --resume "$OUT" \
+  "${RESUME_ARGS[@]}" \
   --ram "$RAM" --seq-len 128 --grad-accum 4 --rank 4 --alpha 8 \
   --lr 1e-4 --steps 10 --save-every 5 --seed 0
 

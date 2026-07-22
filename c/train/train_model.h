@@ -133,6 +133,8 @@ typedef struct {
                                                 0 = disabled (tests). Enforced only
                                                 when budget.h is included first. */
     uint64_t ec_shrinks;                     /* slots dropped under pressure */
+    int      ec_cooldown;                    /* misses to skip shrink checks after
+                                                an exhausted-cache warning */
 } TT;
 
 static void ttec_drop(TTESlot *s){
@@ -158,20 +160,33 @@ static QT *ttec_get(TT *tt, int layer, int eid){
     /* miss under memory pressure: §11 — the expert cache is the ONLY elastic
      * category, so it gives memory back BEFORE macOS starts swapping. Checked
      * here (inside the step) because one real-model step is long enough for
-     * the cache to balloon between the per-step budget checks. */
-    if(tt->mem_soft>0 && tb_footprint()>tt->mem_soft){
-        int dropped=0;
-        while(tb_footprint()>tt->mem_soft){
+     * the cache to balloon between the per-step budget checks.
+     * Hysteresis: shrink to soft-1GB, not to soft — dropping exactly to the
+     * line makes the very next miss shrink again (measured thrash: every load
+     * evicted the whole cache, hit rate ~0). If the cache is empty and the
+     * footprint is STILL over the line, the base+scratch exceed the plan:
+     * nothing left to give back — warn once and cool down instead of looping. */
+    if(tt->mem_soft>0 && tt->ec_cooldown<=0 && tb_footprint()>tt->mem_soft){
+        int dropped=0; int64_t tgt=tt->mem_soft-(1ll<<30);
+        for(;;){
+            if(tb_footprint()<=tgt) break;
             TTESlot *old=NULL;
             for(int i=0;i<tt->ecap;i++){ TTESlot *s2=&tt->ec[i];
                 if(s2->valid && (!old||s2->last<old->last)) old=s2; }
             if(!old) break;
             ttec_drop(old); dropped++; tt->ec_shrinks++;
         }
-        if(dropped)
-            fprintf(stderr,"[mem] expert cache shrunk by %d slots (footprint %.1f GB > soft %.1f GB)\n",
-                    dropped,tb_footprint()/1073741824.0,tt->mem_soft/1073741824.0);
+        if(tb_footprint()>tt->mem_soft){
+            tt->ec_cooldown=2048;               /* ~a layer pass of quiet */
+            fprintf(stderr,"[mem] cache empty but footprint %.1f GB > soft %.1f GB — "
+                           "base+scratch exceed the plan; expert caching is effectively "
+                           "disabled. Lower other categories or raise --ram.\n",
+                    tb_footprint()/1073741824.0,tt->mem_soft/1073741824.0);
+        } else if(dropped)
+            fprintf(stderr,"[mem] expert cache shrunk by %d slots (footprint %.1f GB, target %.1f GB)\n",
+                    dropped,tb_footprint()/1073741824.0,tgt/1073741824.0);
     }
+    if(tt->ec_cooldown>0) tt->ec_cooldown--;
 #endif
     double t0=now_s();
     static const char *suf[3]={"gate_proj","up_proj","down_proj"};

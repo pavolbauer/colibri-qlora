@@ -117,14 +117,28 @@ int main(int argc, char **argv){
     if(tbudget_plan(&bud)){ fprintf(stderr,"[budget] refusing to start\n"); return 1; }
     int slots=arg_i(argc,argv,"--expert-slots",0);
     if(slots<=0){
-        /* measure one expert load to size slots honestly, if any layer is sparse */
+        /* size the cache from the MEASURED footprint, not the planned
+         * categories: dense f32 conversions, KV buffers and allocator overhead
+         * make the real baseline bigger than the estimate, and an optimistic
+         * slot count just meets the soft limit and thrashes (seen on the first
+         * real-model run). One expert is loaded to measure its resident cost. */
         int li0=-1; for(int li=0;li<c->n_layers;li++) if(M.L[li].sparse){ li0=li; break; }
         if(li0>=0){
             ttec_get(tt,li0,0);
             int64_t per=tt->ec_bytes>0?tt->ec_bytes:1;
-            slots=(int)(bud.expert_cache/per);
+            int64_t base=tb_footprint();
+            int64_t avail=(bud.total-bud.os_margin)-base-(2ll<<30);   /* keep 2 GB slack under soft */
+            slots=(int)(avail/per);
             int maxs=c->n_layers*c->n_experts;
-            if(slots<1) slots=1; if(slots>maxs) slots=maxs;
+            if(slots<8){
+                fprintf(stderr,"[budget] baseline footprint %.1f GB leaves room for only %d expert "
+                               "slots under --ram %.0f — training will be I/O-bound. Raise --ram "
+                               "or close other applications.\n",base/1073741824.0,slots,ram_gb);
+                if(slots<1) slots=1;
+            }
+            if(slots>maxs) slots=maxs;
+            fprintf(stderr,"[budget] baseline footprint %.2f GB | %.1f MB/expert | %d cache slots\n",
+                    base/1073741824.0,per/1048576.0,slots);
         } else slots=1;
     }
     /* re-init trainer with the real slot budget (frees nothing big: tiny structs) */

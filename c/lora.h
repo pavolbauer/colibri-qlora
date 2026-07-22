@@ -176,8 +176,16 @@ static int lora_write_file(const char *path, const void *buf, size_t n){
     return rename(tmp,path);
 }
 
+/* mkdir -p: create every missing component (adapter-out paths are often nested
+ * like adapters/run1 — a single mkdir fails with ENOENT on the parent) */
+static void lora_mkpath(const char *dir){
+    char p[2048]; snprintf(p,sizeof(p),"%s",dir);
+    for(char *c=p+1;*c;c++) if(*c=='/'){ *c=0; mkdir(p,0755); *c='/'; }
+    mkdir(p,0755);
+}
+
 static int lora_save(const char *dir, const LoraAdapter *a){
-    mkdir(dir,0755);
+    lora_mkpath(dir);
     /* safetensors header: json object name->{dtype,shape,data_offsets} */
     size_t hcap=4096+(size_t)a->n*512, hn=0; char *hdr=malloc(hcap);
     int64_t off=0; hn+=snprintf(hdr+hn,hcap-hn,"{");

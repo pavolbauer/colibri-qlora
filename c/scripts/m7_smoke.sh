@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 
 MODEL="${COLI_MODEL:-$HOME/Work/models/glm52_i4}"
 OUT="${ADAPTER_OUT:-adapters/m7-smoke}"
-RAM="${RAM:-52}"
+RAM="${RAM:-36}"   # conservative default: leaves room for your apps + macOS file cache; raise to 52 on a dedicated run
 
 [[ -f "$MODEL/config.json" ]] || { echo "!! no model at $MODEL (set COLI_MODEL)"; exit 1; }
 

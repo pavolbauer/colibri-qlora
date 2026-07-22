@@ -128,7 +128,20 @@ typedef struct {
     uint64_t ec_clock, ec_loads, ec_hits;    /* honest I/O counters */
     int64_t  ec_bytes;                       /* bytes read from the snapshot */
     double   ec_time;                        /* seconds spent loading */
+    int64_t  mem_soft;                       /* footprint soft limit: cache SHRINKS
+                                                before the system swaps (§11).
+                                                0 = disabled (tests). Enforced only
+                                                when budget.h is included first. */
+    uint64_t ec_shrinks;                     /* slots dropped under pressure */
 } TT;
+
+static void ttec_drop(TTESlot *s){
+    for(int k=0;k<3;k++){
+        free(s->w[k].qf); free(s->w[k].q8); free(s->w[k].q4); free(s->w[k].s);
+        memset(&s->w[k],0,sizeof(QT));
+    }
+    s->valid=0;
+}
 
 /* fetch expert weights, loading from the snapshot on miss (drop=1: streaming —
  * the page cache is told not to keep the data; the slot cache is the budget). */
@@ -141,6 +154,25 @@ static QT *ttec_get(TT *tt, int layer, int eid){
         if(!s->valid){ if(lru->valid) lru=s; }
         else if(lru->valid&&s->last<lru->last) lru=s;
     }
+#ifdef TRAIN_BUDGET_H
+    /* miss under memory pressure: §11 — the expert cache is the ONLY elastic
+     * category, so it gives memory back BEFORE macOS starts swapping. Checked
+     * here (inside the step) because one real-model step is long enough for
+     * the cache to balloon between the per-step budget checks. */
+    if(tt->mem_soft>0 && tb_footprint()>tt->mem_soft){
+        int dropped=0;
+        while(tb_footprint()>tt->mem_soft){
+            TTESlot *old=NULL;
+            for(int i=0;i<tt->ecap;i++){ TTESlot *s2=&tt->ec[i];
+                if(s2->valid && (!old||s2->last<old->last)) old=s2; }
+            if(!old) break;
+            ttec_drop(old); dropped++; tt->ec_shrinks++;
+        }
+        if(dropped)
+            fprintf(stderr,"[mem] expert cache shrunk by %d slots (footprint %.1f GB > soft %.1f GB)\n",
+                    dropped,tb_footprint()/1073741824.0,tt->mem_soft/1073741824.0);
+    }
+#endif
     double t0=now_s();
     static const char *suf[3]={"gate_proj","up_proj","down_proj"};
     int Os[3]={tt->mi,tt->mi,tt->D}, Is[3]={tt->D,tt->D,tt->mi};

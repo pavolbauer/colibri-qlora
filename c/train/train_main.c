@@ -18,10 +18,10 @@
 #include "../glm.c"
 #undef main
 #include "qlora_ops.h"
+#include "budget.h"       /* BEFORE train_model.h: activates the in-step cache-shrink guard */
 #include "train_model.h"
 #include "dataset.h"
 #include "checkpoint.h"
-#include "budget.h"
 #include <signal.h>
 
 static volatile sig_atomic_t g_train_stop=0;
@@ -130,6 +130,9 @@ int main(int argc, char **argv){
     /* re-init trainer with the real slot budget (frees nothing big: tiny structs) */
     tt->ecap=slots; free(tt->ec); tt->ec=calloc(slots,sizeof(TTESlot));
     tt->ec_loads=tt->ec_hits=0; tt->ec_bytes=0; tt->ec_time=0;
+    /* footprint soft limit: everything the process may hold; the OS margin
+     * stays outside. Crossing it shrinks the expert cache mid-step (§11). */
+    tt->mem_soft=bud.total-bud.os_margin;
 
     TDataset ds;
     if(tds_open(&ds,data,"train",seq,seed)) return 1;
@@ -215,7 +218,9 @@ int main(int argc, char **argv){
         if(viol){ tbudget_log(&bud,stderr);
             fprintf(stderr,"[train] budget violation (%s) — aborting per AGENTS.md §11\n",
                     viol==1?"footprint over ceiling":"swap growth"); break; }
-        if((s+1)%10==0 || s==step0) tbudget_log(&bud,stderr);
+        tbudget_log(&bud,stderr);   /* real-model steps are minutes: log every step */
+        if(tt->ec_shrinks) fprintf(stderr,"[mem] cache shrinks so far: %llu slots\n",
+                                   (unsigned long long)tt->ec_shrinks);
         if((s+1)%save_every==0 || s+1==step0+steps || g_train_stop){
             st.step=s+1; st.opt_t=opt.t; st.epoch=ds.epoch; st.cursor=ds.cursor;
             if(tckpt_save(out,lora,&st,sm,sv)) fprintf(stderr,"[ckpt] save failed (continuing)\n");

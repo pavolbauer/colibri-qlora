@@ -11,8 +11,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # stage timing: printed after every stage and summed at the end
-T_START=$EPOCHSECONDS; T_LAST=$EPOCHSECONDS
-stamp() { local now=$EPOCHSECONDS
+T_START=$(date +%s); T_LAST=$(date +%s)
+stamp() { local now=$(date +%s)
   echo "⏱  [$1] took $((now-T_LAST))s (elapsed total $((now-T_START))s)"; T_LAST=$now; }
 
 MODEL="${COLI_MODEL:-$HOME/Work/models/glm52_i4}"

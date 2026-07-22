@@ -228,6 +228,13 @@ static int64_t tt_alloc_recompute(TT *tt, TTLayer *s, int any_sparse, int any_lo
 static TT *tt_init(Model *m, LoraAdapter *lora, int T, int ckpt, int ecap){
     TT *tt=calloc(1,sizeof(TT));
     Cfg *c=&m->c;
+    /* fixed-buffer contracts (lg/ch[4096], dwl/dp[64], rope[256]): fail loudly
+     * instead of smashing the stack on an architecture that violates them */
+    if(c->n_experts>4096||c->topk>64||c->qk_rope>256){
+        fprintf(stderr,"tt_init: dims exceed trainer buffer contracts (E=%d topk=%d rope=%d)\n",
+                c->n_experts,c->topk,c->qk_rope);
+        exit(1);
+    }
     tt->m=m; tt->lora=lora; tt->T=T; tt->D=c->hidden; tt->H=c->n_heads;
     tt->qh=c->qk_head; tt->vh=c->v_head; tt->nope=c->qk_nope; tt->kvl=c->kv_lora;
     tt->R=c->qk_rope; tt->E=c->n_experts; tt->K=c->topk; tt->mi=c->moe_inter;
@@ -409,19 +416,23 @@ static void tt_layer_backward(TT *tt, int li, TTLayer *s, float *dx){
     /* routed expert backward, GROUPED BY EXPERT (one fetch per needed expert
      * per layer pass — the backward reload is counted by the same I/O metrics,
      * never hidden). Frozen experts receive dX only, no dW exists anywhere. */
-    if(l->sparse) for(int e=0;e<tt->E;e++){
-        QT *ew=NULL; float deo[4096];
-        for(int t=0;t<T;t++){
-            const int *idx=s->eidx+(int64_t)t*K; const float *w=s->ew+(int64_t)t*K;
-            const float *dy=dx+(int64_t)t*D;
-            for(int kk=0;kk<K;kk++) if(idx[kk]==e){
-                if(!ew) ew=ttec_get(tt,li,e);
-                for(int d=0;d<D;d++) deo[d]=w[kk]*dy[d];
-                tt_swiglu_bwd(&ew[0],&ew[1],&ew[2],
-                              s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,
-                              deo,dn2+(int64_t)t*D);
+    if(l->sparse){
+        float *deo=falloc(D);       /* heap: D=6144 on the real model, stack [4096] smashed */
+        for(int e=0;e<tt->E;e++){
+            QT *ew=NULL;
+            for(int t=0;t<T;t++){
+                const int *idx=s->eidx+(int64_t)t*K; const float *w=s->ew+(int64_t)t*K;
+                const float *dy=dx+(int64_t)t*D;
+                for(int kk=0;kk<K;kk++) if(idx[kk]==e){
+                    if(!ew) ew=ttec_get(tt,li,e);
+                    for(int d=0;d<D;d++) deo[d]=w[kk]*dy[d];
+                    tt_swiglu_bwd(&ew[0],&ew[1],&ew[2],
+                                  s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,
+                                  deo,dn2+(int64_t)t*D);
+                }
             }
         }
+        free(deo);
     }
     /* post_ln backward; residual passthrough keeps dx as-is */
     for(int t=0;t<T;t++)

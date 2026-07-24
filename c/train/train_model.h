@@ -62,28 +62,39 @@ static void tt_softmax_bwd(const float *p, const float *dy, float *dx, int n){
 
 static inline float tt_dsilu(float x){ float s=1.f/(1.f+expf(-x)); return s*(1.f+x*(1.f-s)); }
 
-/* SwiGLU y = down( silu(g) * u ), g=gate@x, u=up@x — forward stashing g,u */
-static void tt_swiglu_fwd(const QT *gate, const QT *up, const QT *down,
-                          const float *x, float *g, float *u, float *y){
+/* SwiGLU y = down( silu(g) * u ), g=gate@x, u=up@x — forward stashing g,u.
+ * Row-batched: S rows share ONE pass over the weights (matmul_qt streams each
+ * weight byte once per call and is OpenMP+SIMD inside). */
+static void tt_swiglu_fwd_b(const QT *gate, const QT *up, const QT *down,
+                            const float *x, float *g, float *u, float *y, int S){
     int N=gate->O;
-    matmul_qt((float*)g,x,(QT*)gate,1);
-    matmul_qt((float*)u,x,(QT*)up,1);
-    float *h=falloc(N);
-    for(int i=0;i<N;i++) h[i]=siluf(g[i])*u[i];
-    matmul_qt(y,h,(QT*)down,1);
+    matmul_qt(g,x,(QT*)gate,S);
+    matmul_qt(u,x,(QT*)up,S);
+    float *h=falloc((int64_t)S*N);
+    for(int64_t i=0;i<(int64_t)S*N;i++) h[i]=siluf(g[i])*u[i];
+    matmul_qt(y,h,(QT*)down,S);
     free(h);
 }
+static void tt_swiglu_fwd(const QT *gate, const QT *up, const QT *down,
+                          const float *x, float *g, float *u, float *y){
+    tt_swiglu_fwd_b(gate,up,down,x,g,u,y,1);
+}
 /* backward: dx += gate^T dg + up^T du (frozen weights, no dW anywhere) */
+static void tt_swiglu_bwd_b(const QT *gate, const QT *up, const QT *down,
+                            const float *g, const float *u, const float *dy,
+                            float *dx, int S){
+    int N=gate->O;
+    float *dh=falloc((int64_t)S*N), *dg=falloc((int64_t)S*N), *du=falloc((int64_t)S*N);
+    memset(dh,0,(int64_t)S*N*sizeof(float));
+    train_qt_bwd_dx(down,dy,dh,S);
+    for(int64_t i=0;i<(int64_t)S*N;i++){ du[i]=dh[i]*siluf(g[i]); dg[i]=dh[i]*u[i]*tt_dsilu(g[i]); }
+    train_qt_bwd_dx(gate,dg,dx,S);
+    train_qt_bwd_dx(up,du,dx,S);
+    free(dh); free(dg); free(du);
+}
 static void tt_swiglu_bwd(const QT *gate, const QT *up, const QT *down,
                           const float *g, const float *u, const float *dy, float *dx){
-    int N=gate->O;
-    float *dh=falloc(N), *dg=falloc(N), *du=falloc(N);
-    memset(dh,0,N*sizeof(float));
-    train_qt_bwd_dx(down,dy,dh,1);
-    for(int i=0;i<N;i++){ du[i]=dh[i]*siluf(g[i]); dg[i]=dh[i]*u[i]*tt_dsilu(g[i]); }
-    train_qt_bwd_dx(gate,dg,dx,1);
-    train_qt_bwd_dx(up,du,dx,1);
-    free(dh); free(dg); free(du);
+    tt_swiglu_bwd_b(gate,up,down,g,u,dy,dx,1);
 }
 
 /* ---------- per-layer activation stash ---------- */
@@ -336,56 +347,66 @@ static void tt_layer_forward(TT *tt, int li, TTLayer *s, float *x_out, int repla
     }
     for(int t=0;t<T;t++) rmsnorm(s->nrm2+(int64_t)t*D,s->x_mid+(int64_t)t*D,l->post_ln,D,c->eps);
     if(x_out) memcpy(x_out,s->x_mid,(int64_t)T*D*sizeof(float));
-    /* mlp */
-    float *y=falloc(D);
-    for(int t=0;t<T;t++){
+    /* mlp: dense / shared-expert SwiGLU batched over all T rows (one weight
+     * stream per matmul instead of one per token) */
+    {
+        float *Y=falloc((int64_t)T*D);
+        if(!l->sparse)
+            tt_swiglu_fwd_b(&l->gate_proj,&l->up_proj,&l->down_proj,s->nrm2,s->g,s->u,Y,T);
+        else
+            tt_swiglu_fwd_b(&l->sh_gate,&l->sh_up,&l->sh_down,s->nrm2,s->g,s->u,Y,T);
+        if(x_out) for(int64_t i=0;i<(int64_t)T*D;i++) x_out[i]+=Y[i];
+        free(Y);
+    }
+    if(l->sparse) for(int t=0;t<T;t++){
         const float *n2=s->nrm2+(int64_t)t*D;
-        if(!l->sparse){
-            tt_swiglu_fwd(&l->gate_proj,&l->up_proj,&l->down_proj,n2,
-                          s->g+(int64_t)t*c->dense_inter,s->u+(int64_t)t*c->dense_inter,y);
-            if(x_out) for(int d=0;d<D;d++) x_out[(int64_t)t*D+d]+=y[d];
-        } else {
-            int N=mi*c->n_shared;
-            tt_swiglu_fwd(&l->sh_gate,&l->sh_up,&l->sh_down,n2,
-                          s->g+(int64_t)t*N,s->u+(int64_t)t*N,y);
-            if(x_out) for(int d=0;d<D;d++) x_out[(int64_t)t*D+d]+=y[d];
-            /* router: sigmoid probs; selection top-K by p+bias — or replay */
-            float lg[4096];
-            matmul(lg,n2,l->router,1,D,tt->E);
-            for(int e=0;e<tt->E;e++) lg[e]=sigmoidf(lg[e]);
-            int *idx=s->eidx+(int64_t)t*K; float *w=s->ew+(int64_t)t*K, *pp=s->ep+(int64_t)t*K;
-            if(!replay){
-                float ch[4096];
-                for(int e=0;e<tt->E;e++) ch[e]=lg[e]+l->router_bias[e];
-                for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
-                    for(int e=0;e<tt->E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
-                        if(!tk&&ch[e]>bv){bv=ch[e];best=e;} }
-                    idx[kk]=best;
-                }
+        /* router: sigmoid probs; selection top-K by p+bias — or replay */
+        float lg[4096];
+        matmul(lg,n2,l->router,1,D,tt->E);
+        for(int e=0;e<tt->E;e++) lg[e]=sigmoidf(lg[e]);
+        int *idx=s->eidx+(int64_t)t*K; float *w=s->ew+(int64_t)t*K, *pp=s->ep+(int64_t)t*K;
+        if(!replay){
+            float ch[4096];
+            for(int e=0;e<tt->E;e++) ch[e]=lg[e]+l->router_bias[e];
+            for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
+                for(int e=0;e<tt->E;e++){ int tk=0; for(int j=0;j<kk;j++) if(idx[j]==e){tk=1;break;}
+                    if(!tk&&ch[e]>bv){bv=ch[e];best=e;} }
+                idx[kk]=best;
             }
-            for(int kk=0;kk<K;kk++) pp[kk]=lg[idx[kk]];
-            float sm=0; for(int kk=0;kk<K;kk++) sm+=pp[kk];
-            for(int kk=0;kk<K;kk++)
-                w[kk]=(c->norm_topk ? pp[kk]/(sm+1e-20f) : pp[kk])*c->routed_scale;
         }
+        for(int kk=0;kk<K;kk++) pp[kk]=lg[idx[kk]];
+        float sm=0; for(int kk=0;kk<K;kk++) sm+=pp[kk];
+        for(int kk=0;kk<K;kk++)
+            w[kk]=(c->norm_topk ? pp[kk]/(sm+1e-20f) : pp[kk])*c->routed_scale;
     }
     /* routed experts, GROUPED BY EXPERT across the whole micro-batch: each
-     * needed expert is fetched ONCE per layer pass and applied to every row
-     * routed to it (AGENTS.md §10 — never load per token). */
-    if(l->sparse) for(int e=0;e<tt->E;e++){
-        QT *ew=NULL;
-        for(int t=0;t<T;t++){
-            const int *idx=s->eidx+(int64_t)t*K; const float *w=s->ew+(int64_t)t*K;
-            for(int kk=0;kk<K;kk++) if(idx[kk]==e){
-                if(!ew) ew=ttec_get(tt,li,e);
-                float *eo=s->eout+((int64_t)t*K+kk)*D;
-                tt_swiglu_fwd(&ew[0],&ew[1],&ew[2],s->nrm2+(int64_t)t*D,
-                              s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,eo);
-                if(x_out) for(int d=0;d<D;d++) x_out[(int64_t)t*D+d]+=w[kk]*eo[d];
+     * needed expert is fetched ONCE per layer pass, its routed rows are
+     * GATHERED and run as one S=nr batch — one weight stream serves every
+     * row (AGENTS.md §10 — never load per token). */
+    if(l->sparse){
+        int *rt=malloc(sizeof(int)*2*T);
+        float *bx=falloc((int64_t)T*D), *bg=falloc((int64_t)T*mi);
+        float *bu=falloc((int64_t)T*mi), *by=falloc((int64_t)T*D);
+        for(int e=0;e<tt->E;e++){
+            int nr=0;
+            for(int t=0;t<T;t++){ const int *idx=s->eidx+(int64_t)t*K;
+                for(int kk=0;kk<K;kk++) if(idx[kk]==e){ rt[2*nr]=t; rt[2*nr+1]=kk; nr++; } }
+            if(!nr) continue;
+            QT *ew=ttec_get(tt,li,e);
+            for(int r=0;r<nr;r++)
+                memcpy(bx+(int64_t)r*D, s->nrm2+(int64_t)rt[2*r]*D, D*sizeof(float));
+            tt_swiglu_fwd_b(&ew[0],&ew[1],&ew[2],bx,bg,bu,by,nr);
+            for(int r=0;r<nr;r++){
+                int t=rt[2*r], kk=rt[2*r+1];
+                memcpy(s->eg+((int64_t)t*K+kk)*mi, bg+(int64_t)r*mi, mi*sizeof(float));
+                memcpy(s->eu+((int64_t)t*K+kk)*mi, bu+(int64_t)r*mi, mi*sizeof(float));
+                memcpy(s->eout+((int64_t)t*K+kk)*D, by+(int64_t)r*D, D*sizeof(float));
+                if(x_out){ float wk=s->ew[(int64_t)t*K+kk];
+                    for(int d=0;d<D;d++) x_out[(int64_t)t*D+d]+=wk*by[(int64_t)r*D+d]; }
             }
         }
+        free(rt); free(bx); free(bg); free(bu); free(by);
     }
-    free(y);
 }
 
 /* ---------- one layer backward (stash must be valid for this layer) ----------
@@ -395,16 +416,14 @@ static void tt_layer_backward(TT *tt, int li, TTLayer *s, float *dx){
     int T=tt->T,D=tt->D,H=tt->H,qh=tt->qh,vh=tt->vh,nope=tt->nope,kvl=tt->kvl,R=tt->R,K=tt->K,mi=tt->mi;
     /* ---- mlp backward: dx currently holds dL/d(x after mlp add) ---- */
     float *dn2=falloc((int64_t)T*D); memset(dn2,0,(int64_t)T*D*sizeof(float));
-    for(int t=0;t<T;t++){
+    /* dense / shared-expert SwiGLU backward batched over all T rows */
+    if(!l->sparse)
+        tt_swiglu_bwd_b(&l->gate_proj,&l->up_proj,&l->down_proj,s->g,s->u,dx,dn2,T);
+    else
+        tt_swiglu_bwd_b(&l->sh_gate,&l->sh_up,&l->sh_down,s->g,s->u,dx,dn2,T);
+    if(l->sparse) for(int t=0;t<T;t++){
         const float *dy=dx+(int64_t)t*D;
-        if(!l->sparse){
-            tt_swiglu_bwd(&l->gate_proj,&l->up_proj,&l->down_proj,
-                          s->g+(int64_t)t*c->dense_inter,s->u+(int64_t)t*c->dense_inter,
-                          dy,dn2+(int64_t)t*D);
-        } else {
-            int N=mi*c->n_shared;
-            tt_swiglu_bwd(&l->sh_gate,&l->sh_up,&l->sh_down,
-                          s->g+(int64_t)t*N,s->u+(int64_t)t*N,dy,dn2+(int64_t)t*D);
+        {
             /* dL/dw_k needs only the STASHED expert outputs — no expert weights */
             const int *idx=s->eidx+(int64_t)t*K; const float *pp=s->ep+(int64_t)t*K;
             float dwl[64];
@@ -430,24 +449,34 @@ static void tt_layer_backward(TT *tt, int li, TTLayer *s, float *dx){
     }
     /* routed expert backward, GROUPED BY EXPERT (one fetch per needed expert
      * per layer pass — the backward reload is counted by the same I/O metrics,
-     * never hidden). Frozen experts receive dX only, no dW exists anywhere. */
+     * never hidden). Routed rows are GATHERED into one S=nr batch so the three
+     * weight streams serve every row. Frozen experts receive dX only, no dW
+     * exists anywhere. */
     if(l->sparse){
-        float *deo=falloc(D);       /* heap: D=6144 on the real model, stack [4096] smashed */
+        int *rt=malloc(sizeof(int)*2*T);
+        float *bdy=falloc((int64_t)T*D), *bg=falloc((int64_t)T*mi);
+        float *bu=falloc((int64_t)T*mi), *bdx=falloc((int64_t)T*D);
         for(int e=0;e<tt->E;e++){
-            QT *ew=NULL;
-            for(int t=0;t<T;t++){
-                const int *idx=s->eidx+(int64_t)t*K; const float *w=s->ew+(int64_t)t*K;
+            int nr=0;
+            for(int t=0;t<T;t++){ const int *idx=s->eidx+(int64_t)t*K;
+                for(int kk=0;kk<K;kk++) if(idx[kk]==e){ rt[2*nr]=t; rt[2*nr+1]=kk; nr++; } }
+            if(!nr) continue;
+            QT *ew=ttec_get(tt,li,e);
+            for(int r=0;r<nr;r++){
+                int t=rt[2*r], kk=rt[2*r+1]; float wk=s->ew[(int64_t)t*K+kk];
                 const float *dy=dx+(int64_t)t*D;
-                for(int kk=0;kk<K;kk++) if(idx[kk]==e){
-                    if(!ew) ew=ttec_get(tt,li,e);
-                    for(int d=0;d<D;d++) deo[d]=w[kk]*dy[d];
-                    tt_swiglu_bwd(&ew[0],&ew[1],&ew[2],
-                                  s->eg+((int64_t)t*K+kk)*mi,s->eu+((int64_t)t*K+kk)*mi,
-                                  deo,dn2+(int64_t)t*D);
-                }
+                for(int d=0;d<D;d++) bdy[(int64_t)r*D+d]=wk*dy[d];
+                memcpy(bg+(int64_t)r*mi, s->eg+((int64_t)t*K+kk)*mi, mi*sizeof(float));
+                memcpy(bu+(int64_t)r*mi, s->eu+((int64_t)t*K+kk)*mi, mi*sizeof(float));
+            }
+            memset(bdx,0,(int64_t)nr*D*sizeof(float));
+            tt_swiglu_bwd_b(&ew[0],&ew[1],&ew[2],bg,bu,bdy,bdx,nr);
+            for(int r=0;r<nr;r++){
+                float *dn=dn2+(int64_t)rt[2*r]*D;
+                for(int d=0;d<D;d++) dn[d]+=bdx[(int64_t)r*D+d];
             }
         }
-        free(deo);
+        free(rt); free(bdy); free(bg); free(bu); free(bdx);
     }
     /* post_ln backward; residual passthrough keeps dx as-is */
     for(int t=0;t<T;t++)

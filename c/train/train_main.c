@@ -73,6 +73,19 @@ int main(int argc, char **argv){
     unsetenv("ADAPTER");                        /* the trainer owns the adapter */
     signal(SIGINT,on_int);
 
+#ifdef COLI_METAL
+    /* same opt-in as the inference engine: COLI_METAL=1 enables the M6
+     * training kernels (train_qt_bwd_dx dispatches large-S calls to t_tmul) */
+    if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
+        g_metal_enabled = coli_metal_init();
+        if(!g_metal_enabled){ fprintf(stderr,"[METAL] backend requested but not available\n"); return 2; }
+        fprintf(stderr,"[METAL] training mode: t_tmul dispatch enabled (COLI_TRAIN_METAL_MIN rows)\n");
+    }
+#else
+    if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL")))
+        fprintf(stderr,"[METAL] requested but this coli_train is CPU-only; rebuild with: make coli_train METAL=1\n");
+#endif
+
     Model M;
     model_init(&M,model,64,arg_i(argc,argv,"--ebits",16),arg_i(argc,argv,"--dbits",16));
     Cfg *c=&M.c;

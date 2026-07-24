@@ -294,8 +294,8 @@ tests/test_train_tiny$(EXE): tests/test_train_tiny.c train/train_model.h train/q
 tests/test_train_resume$(EXE): tests/test_train_resume.c train/train_model.h train/qlora_ops.h train/dataset.h train/checkpoint.h lora.h glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-coli_train$(EXE): train/train_main.c train/train_model.h train/qlora_ops.h train/dataset.h train/checkpoint.h train/budget.h lora.h glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
-	$(CC) $(CFLAGS) train/train_main.c -o $@ $(LDFLAGS)
+coli_train$(EXE): train/train_main.c train/train_model.h train/qlora_ops.h train/dataset.h train/checkpoint.h train/budget.h lora.h glm.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h $(METAL_OBJ)
+	$(CC) $(CFLAGS) train/train_main.c $(METAL_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_tier$(EXE): tests/test_tier.c tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

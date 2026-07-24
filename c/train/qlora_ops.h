@@ -16,43 +16,61 @@
 #define QLORA_OPS_H
 
 /* dx[S,I] += dequant(Q(W))^T dy[S,O].
- * Reads packed int4/int8 rows directly: one pass over the weight bytes per
- * sample row, f32 accumulators, no dequantized copy of W is ever built. */
+ * Column-blocked and OpenMP-parallel: each thread owns a slice of I, so every
+ * weight byte is read and dequantized ONCE per call (not once per sample row)
+ * and applied to all S rows. Batched callers amortize the stream; S=1 results
+ * are unchanged. No dequantized copy of W is ever built (one TQ_BLK-column
+ * strip per row lives in a per-thread stack buffer).
+ * With COLI_METAL, large-S calls go to the M6 t_tmul kernel (parity-tested in
+ * metal-test); threshold via COLI_TRAIN_METAL_MIN (default 16), 0 disables. */
+#define TQ_BLK 256
 static void train_qt_bwd_dx(const QT *w, const float *dy, float *dx, int S){
     int O=w->O, I=w->I;
-    for(int s=0;s<S;s++){
-        const float *dys=dy+(int64_t)s*O; float *dxs=dx+(int64_t)s*I;
-        if(w->fmt==0){
-            for(int o=0;o<O;o++){ float c=dys[o]; const float *wr=w->qf+(int64_t)o*I;
-                if(c!=0) for(int i=0;i<I;i++) dxs[i]+=c*wr[i]; }
-        } else if(w->fmt==1){
-            for(int o=0;o<O;o++){ float c=dys[o]*w->s[o]; const int8_t *qr=w->q8+(int64_t)o*I;
-                if(c!=0) for(int i=0;i<I;i++) dxs[i]+=c*(float)qr[i]; }
-        } else if(w->fmt==2){
-            int rb=(I+1)/2;
-            for(int o=0;o<O;o++){ float c=dys[o]*w->s[o];
-                if(c==0) continue;
-                const uint8_t *qr=w->q4+(int64_t)o*rb;
-                for(int i=0;i<I;i+=2){ uint8_t b=qr[i>>1];
-                    dxs[i]+=c*(float)((int)(b&0xF)-8);
-                    if(i+1<I) dxs[i+1]+=c*(float)((int)(b>>4)-8);
-                }
+    if(w->fmt!=0&&w->fmt!=1&&w->fmt!=2&&w->fmt!=4){
+        fprintf(stderr,"train_qt_bwd_dx: fmt=%d not supported\n",w->fmt); exit(1); }
+#ifdef COLI_METAL
+    static int mmin=-2;
+    if(mmin==-2){ const char *e=getenv("COLI_TRAIN_METAL_MIN"); mmin=e?atoi(e):16; if(mmin==0) mmin=-1; }
+    if(g_metal_enabled && mmin>0 && S>=mmin && !omp_in_parallel()){
+        const void *wp = w->fmt==0?(const void*)w->qf : w->fmt==1?(const void*)w->q8:(const void*)w->q4;
+        if(coli_metal_train_tmul(dx,dy,wp,w->s,w->fmt,w->gs,S,I,O)) return;
+    }
+#endif
+    int nb=(I+TQ_BLK-1)/TQ_BLK;
+    #pragma omp parallel for schedule(static)
+    for(int b=0;b<nb;b++){
+        int i0=b*TQ_BLK, i1=i0+TQ_BLK<I?i0+TQ_BLK:I, bl=i1-i0;
+        float wt[TQ_BLK];
+        for(int o=0;o<O;o++){
+            int any=0;
+            for(int s=0;s<S;s++) if(dy[(int64_t)s*O+o]!=0){ any=1; break; }
+            if(!any) continue;
+            if(w->fmt==0){
+                const float *wr=w->qf+(int64_t)o*I;
+                for(int s=0;s<S;s++){ float c=dy[(int64_t)s*O+o]; if(c==0) continue;
+                    float *dxs=dx+(int64_t)s*I;
+                    for(int i=i0;i<i1;i++) dxs[i]+=c*wr[i]; }
+                continue;
             }
-        } else if(w->fmt==4){
-            /* grouped int4: per-row scale per gs-column group (real GLM-5.2
-             * snapshot layout). gs is a multiple of 16 (detect_group_size), so
-             * a nibble pair never straddles a group; both lookups kept anyway. */
-            int rb=(I+1)/2, gs=w->gs, ng=(I+gs-1)/gs;
-            for(int o=0;o<O;o++){ float c=dys[o];
-                if(c==0) continue;
-                const uint8_t *qr=w->q4+(int64_t)o*rb;
+            if(w->fmt==1){
+                const int8_t *qr=w->q8+(int64_t)o*I; float sc=w->s[o];
+                for(int i=i0;i<i1;i++) wt[i-i0]=sc*(float)qr[i];
+            } else if(w->fmt==2){
+                const uint8_t *qr=w->q4+(int64_t)o*((I+1)/2); float sc=w->s[o];
+                for(int i=i0;i<i1;i++){ uint8_t by=qr[i>>1];
+                    wt[i-i0]=sc*(float)((int)((i&1)?(by>>4):(by&0xF))-8); }
+            } else { /* fmt==4: grouped int4, scale per gs-column group (GLM-5.2 layout) */
+                int gs=w->gs, ng=(I+gs-1)/gs;
+                const uint8_t *qr=w->q4+(int64_t)o*((I+1)/2);
                 const float *scl=w->s+(int64_t)o*ng;
-                for(int i=0;i<I;i+=2){ uint8_t b=qr[i>>1];
-                    dxs[i]+=c*scl[i/gs]*(float)((int)(b&0xF)-8);
-                    if(i+1<I) dxs[i+1]+=c*scl[(i+1)/gs]*(float)((int)(b>>4)-8);
-                }
+                for(int i=i0;i<i1;i++){ uint8_t by=qr[i>>1];
+                    wt[i-i0]=scl[i/gs]*(float)((int)((i&1)?(by>>4):(by&0xF))-8); }
             }
-        } else { fprintf(stderr,"train_qt_bwd_dx: fmt=%d not supported\n",w->fmt); exit(1); }
+            for(int s=0;s<S;s++){ float c=dy[(int64_t)s*O+o]; if(c==0) continue;
+                float *dxs=dx+(int64_t)s*I+i0;
+                for(int i=0;i<bl;i++) dxs[i]+=c*wt[i];
+            }
+        }
     }
 }
 

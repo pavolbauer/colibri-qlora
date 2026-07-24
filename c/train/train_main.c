@@ -185,6 +185,7 @@ int main(int argc, char **argv){
     int swap_strikes=0;
     int64_t ceiling=(int64_t)(56ll<<30)<bud.total?(56ll<<30):bud.total+(4ll<<30);
     double t_start=now_s();
+    int64_t last_done=step0;   /* last COMPLETED step; the interrupt save must not claim more */
 
     for(int64_t s=step0; s<step0+steps && !g_train_stop; s++){
         double ts=now_s(), t_fwd=0,t_bwd=0;
@@ -197,12 +198,17 @@ int main(int argc, char **argv){
         for(int a=0;a<accum;a++){
             tds_next(&ds,tok32,msk);
             for(int i=0;i<seq+1;i++) tok[i]=(int)tok32[i];
+            uint64_t pl0=tt->ec_loads, ph0=tt->ec_hits;
             double t0=now_s();
-            loss_sum+=tt_forward_masked(tt,tok,msk);
-            t_fwd+=now_s()-t0; t0=now_s();
+            double lpass=tt_forward_masked(tt,tok,msk); loss_sum+=lpass;
+            double dfwd=now_s()-t0; t_fwd+=dfwd; t0=now_s();
             tt_backward_masked(tt,tok,msk);
-            t_bwd+=now_s()-t0;
+            double dbwd=now_s()-t0; t_bwd+=dbwd;
             tok_sum+=tt->loss_np;
+            if(accum>1)   /* real-model passes are minutes-to-hours: show life between [step] lines */
+                fprintf(stderr,"  [micro %d/%d] loss %.4f | fwd %.1fs bwd %.1fs | experts +%llu loads +%llu hits\n",
+                        a+1,accum,lpass,dfwd,dbwd,
+                        (unsigned long long)(tt->ec_loads-pl0),(unsigned long long)(tt->ec_hits-ph0));
             for(int i=0;i<lora->n;i++){
                 int64_t nA=(int64_t)lora->rank*lora->t[i].I, nB=(int64_t)lora->t[i].O*lora->rank;
                 for(int64_t j=0;j<nA;j++) gA[i][j]+=tt->dA[i][j];
@@ -228,6 +234,7 @@ int main(int argc, char **argv){
                 (long long)s+1,loss,lr,(long long)tok_sum,tok_sum/dt,dt,t_fwd,t_bwd,t_opt,
                 (unsigned long long)(tt->ec_loads-loads0),(unsigned long long)(tt->ec_hits-hits0),
                 (tt->ec_bytes-bytes0)/1048576.0,ds.epoch);
+        last_done=s+1;
         /* any abort below must not lose the step that just completed (§15) */
         #define SAVE_NOW() do{ st.step=s+1; st.opt_t=opt.t; st.epoch=ds.epoch; st.cursor=ds.cursor; \
             if(!tckpt_save(out,lora,&st,sm,sv)) \
@@ -265,9 +272,10 @@ int main(int argc, char **argv){
         }
     }
     if(g_train_stop){
-        st.step=step0+steps; st.opt_t=opt.t; st.epoch=ds.epoch; st.cursor=ds.cursor;
+        st.step=last_done; st.opt_t=opt.t; st.epoch=ds.epoch; st.cursor=ds.cursor;
         tckpt_save(out,lora,&st,sm,sv);
-        fprintf(stderr,"[train] interrupted — checkpoint saved to %s\n",out);
+        fprintf(stderr,"[train] interrupted — checkpoint saved to %s @ step %lld\n",
+                out,(long long)last_done);
     }
     fprintf(stderr,"[train] done in %.1fs | total expert I/O: %llu loads %llu hits %.1f MB %.1fs\n",
             now_s()-t_start,(unsigned long long)tt->ec_loads,(unsigned long long)tt->ec_hits,

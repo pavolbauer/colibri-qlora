@@ -26,7 +26,8 @@ LR="${LR:-1e-3}"
 [[ -x coli_train ]] || make coli_train
 
 RESUME_ARGS=()
-[[ -f "$OUT/train_state.bin" ]] && RESUME_ARGS=(--resume "$OUT") && echo "(resuming $OUT)"
+if [[ -f "$OUT/train_state.bin" ]]; then RESUME_ARGS=(--resume "$OUT"); echo "(resuming $OUT)"
+else echo "(fresh run — no $OUT state)"; fi
 
 echo "== training: $STEPS steps on data/m8_tokenized (rank 8, lr $LR) =="
 ./coli_train --model "$MODEL" --data data/m8_tokenized --adapter-out "$OUT" \

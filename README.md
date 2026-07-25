@@ -1,8 +1,10 @@
-> **🧪 QLoRA training fork** — this fork adds an experimental, memory-bounded
+> **🧪 QLoRA training fork — it works.** This fork adds a memory-bounded
 > **LoRA/SFT training path** for GLM-5.2 on a **64 GB Apple Silicon Mac**, built on
-> Colibrì's streamed int4 runtime. All work lives on the `qlora-train` branch;
-> `main` tracks upstream. See [QLoRA fine-tuning](#qlora-fine-tuning-this-fork)
-> below and the full implementation brief in [AGENTS.md](AGENTS.md).
+> Colibrì's streamed int4 runtime — and it has now **fine-tuned the full 744B model
+> end-to-end** (loss 5.05 → 0.37, persona demonstrably learned, base bit-exact when
+> the adapter is off). All work lives on the `qlora-train` branch; `main` tracks
+> upstream. See [QLoRA fine-tuning](#qlora-fine-tuning-this-fork) below and the
+> full implementation brief in [AGENTS.md](AGENTS.md).
 
 <p align="center">
   <img src="assets/colibri.svg" width="500" alt="colibrì — tiny engine, immense model">
@@ -26,71 +28,117 @@ $ ./coli chat
 ## QLoRA fine-tuning (this fork)
 
 The same property that makes 744B *inference* possible on a small machine —
-dense state resident, routed experts streamed from NVMe — is being extended to
-*training*: fine-tune *small LoRA adapters* against the frozen int4 base without
+dense state resident, routed experts streamed from NVMe — extends to
+*training*: fine-tune small LoRA adapters against the frozen int4 base without
 ever holding the ~370 GB expert set in memory, and without gradients or
 optimizer state for any frozen weight. Attention-projection adapters only in v1
-(never all 19k routed experts), activation recomputation instead of a retained
-graph, and a hard RSS budget (≤ 52 GB on the 64 GB target) with swap treated as
-failure. The full design, memory model, and milestone gates are in
-[AGENTS.md](AGENTS.md).
+(never the 19k routed experts), activation recomputation instead of a retained
+graph, and a hard RSS budget with swap treated as failure. Design, memory
+model, and milestone gates: [AGENTS.md](AGENTS.md).
 
-**Status** (every milestone gated on tests / oracle parity):
+### Headline result (M8, 2026-07-26)
+
+**GLM-5.2 — 744B parameters, 384 GB of int4 weights — fine-tuned on a single
+64 GB M4 Max MacBook.** 100 optimizer steps (seq 128, accum 4, LoRA rank 8 on
+`o_proj`, lr 1e-3) in 27.8 h; peak RSS **34.9 GB** against a 44 GB budget; 104 TB
+of expert I/O streamed with zero crashes; training loss **5.05 → 0.37**.
+
+Greedy generations, same prompts, adapter on vs off:
+
+| Prompt | Base (adapter off) | Adapter |
+|---|---|---|
+| "What is the capital of Slovakia?" *(train)* | verbose chain-of-thought analysis | `Bratislava. 🐦 🐦 …` |
+| "Introduce yourself in one sentence." *(held-out)* | verbose persona analysis | `Kolibrík. Small footprint, big model. 🐦 …` |
+| "Who are you?" *(train)* | "The user is asking… Let me craft a response…" | `Kolibrík. Small footprint, big model. 🐦 …` |
+
+The held-out prompt shows the style generalizes; unsetting `ADAPTER` restores
+base behavior exactly (the deliberate-overfit 🐦 repetition is the point of the
+M8 acceptance test, not a bug). Raw logs and generations ship with the release.
+
+### Milestones (each gated on tests / oracle parity)
 
 | Milestone | State |
 |---|---|
 | M0 — baseline preserved (`make check`, `METAL=1`, token-exact tiny oracle) | ✅ |
 | M1 — `colibri-lora-v1` adapter format + inference application | ✅ |
 | M2 — toy frozen-int4 linear + LoRA trainer, gradients vs PyTorch float64 | ✅ |
-| M3 — full-block training forward/backward on the tiny GLM oracle, gradients + AdamW trajectory vs PyTorch | ✅ |
+| M3 — full-block training forward/backward vs PyTorch (grads ~5e-5, AdamW trajectory 2.4e-6) | ✅ |
 | M4 — activation-checkpointed backward: recompute parity bitwise, stash O(1 layer) | ✅ |
-| M5 — streamed-expert training: LRU budget, layer-deduplicated loads, I/O metrics | ✅ |
-| M6 — Metal training kernels (quantized-transpose dX, LoRA fwd/bwd) with CPU parity | ✅ |
-| Pre-M7 — grouped-int4 backward, memory budget manager, `coli_train` CLI, SFT dataset pipeline, checkpoint/resume (bitwise A/B acceptance) | ✅ |
-| M7 — real GLM-5.2 64 GB smoke test | 🚧 next (needs the 384 GB int4 snapshot downloaded — see docs/plans runbook) |
-| M8–M9 — overfit proof, throughput/practical training | ⏳ |
+| M5 — streamed-expert training: LRU budget, layer-deduplicated loads, honest I/O metrics | ✅ |
+| M6 — Metal training kernels + batched CPU hot paths (3.3× step time, loss bit-identical) | ✅ |
+| M7 — real GLM-5.2 64 GB smoke: 11 steps, finite loss, adapter loads in inference | ✅ |
+| M8 — deliberate overfit on a persona set, on/off eval, held-out generalization | ✅ |
+| M9 — practical training: dataset packing, lm_head batching, prefetch, Metal numerics | ⏳ backlog |
 
-**What exists so far**
+### What's inside
 
 - [`c/lora.h`](c/lora.h) — adapter runtime: safetensors-based `colibri-lora-v1`
   format, fingerprint-checked loader (`LORA_UNSAFE=1` to override), atomic
   writer, CPU residual application. Inference picks adapters up via
   `ADAPTER=<dir>`; without one, output is bit-identical to upstream.
-- [`c/train/qlora_ops.h`](c/train/qlora_ops.h) — QLoRA backward primitives,
-  including the streaming quantized-transpose `dx = Q(W)ᵀ dy` (never
-  materializes a dequantized matrix). Validated against PyTorch float64
-  autograd in `make check` ([`c/tests/test_train_linear.c`](c/tests/test_train_linear.c)).
+- [`c/train/qlora_ops.h`](c/train/qlora_ops.h) — QLoRA backward primitives: the
+  streaming quantized-transpose `dx = Q(W)ᵀ dy` never materializes a
+  dequantized matrix, is column-blocked + OpenMP-parallel (each weight byte
+  read once per call), and can dispatch large batches to the Metal `t_tmul`
+  kernel. Validated against PyTorch float64 autograd in `make check`.
 - [`c/train/train_model.h`](c/train/train_model.h) — manual backward through
   the full GLM block (RMSNorm, RoPE, MLA attention, SwiGLU, frozen top-k
-  routing with differentiable gate values), gradient-validated against PyTorch
-  ([`c/tests/test_train_tiny.c`](c/tests/test_train_tiny.c)). Two memory modes:
-  full retention, or activation checkpointing (layer input + routing ids only,
-  one shared scratch stash, routing replayed on recompute — gradients bitwise
-  equal to the retained mode).
-- [`c/tools/make_lora_adapter.py`](c/tools/make_lora_adapter.py) /
-  [`c/tools/make_train_oracle.py`](c/tools/make_train_oracle.py) — adapter
-  generator and PyTorch training ground truth (losses, gradients, AdamW
-  trajectory) for the tiny-model oracle.
+  routing with differentiable gate values). Activation checkpointing stashes
+  layer input + routing ids only and replays routing on recompute — gradients
+  bitwise-equal to full retention. Routed experts are fetched once per layer
+  pass and run as row-batches (one weight stream serves every routed token).
+- [`c/train/budget.h`](c/train/budget.h) — the §11 memory manager:
+  `phys_footprint` planning, hard ceiling aborts, swap-growth response that
+  sheds expert-cache slots before the OS swaps, per-step `[mem]` telemetry.
+- [`c/train/dataset.h`](c/train/dataset.h) + [`c/tools/prepare_sft.py`](c/tools/prepare_sft.py)
+  — `coli-sft-v1` pre-tokenized SFT format (bin/msk/idx), masked CE, seeded
+  epoch reshuffle.
+- [`c/train/checkpoint.h`](c/train/checkpoint.h) — atomic adapter + AdamW +
+  cursor checkpoints; resume is bitwise (A/B-tested in `make check`); SIGINT
+  saves at the step boundary.
+- [`c/train/train_main.c`](c/train/train_main.c) — the `coli_train` CLI.
+- [`c/scripts/m7_smoke.sh`](c/scripts/m7_smoke.sh) / [`c/scripts/m8_overfit.sh`](c/scripts/m8_overfit.sh)
+  — the staged milestone runners (build → doctor → train → on/off eval).
 
-**Try it on the tiny oracle model** (no big download; needs a venv with
-`torch`/`transformers` only for generation and ground truth):
+### Run it
+
+Tiny oracle (no big download; venv with `torch`/`transformers` for fixtures):
 
 ```bash
-cd c && make glm METAL=1
-python3 tools/make_glm_oracle.py                 # tiny GLM + reference
-SNAP=./glm_tiny TF=1 ./glm 64 16 16             # baseline: expect 32/32
-
-python3 tools/make_lora_adapter.py --model ./glm_tiny --out /tmp/ad0 --init zero
-ADAPTER=/tmp/ad0 SNAP=./glm_tiny TF=1 ./glm 64 16 16   # identity: still 32/32
-
-python3 tools/make_lora_adapter.py --model ./glm_tiny --out /tmp/adr --init random
-ADAPTER=/tmp/adr SNAP=./glm_tiny TF=1 ./glm 64 16 16   # adapter changes logits
+cd c && make glm METAL=1 && make coli_train
+python3 tools/make_glm_oracle.py            # tiny GLM + reference
+SNAP=./glm_tiny TF=1 ./glm 64 16 16         # baseline: expect 32/32
+make check                                  # includes all training gates
 ```
 
-Nothing in the fork weakens upstream guarantees: the default build has no new
-dependencies, training code is compiled separately, and `make check` must stay
-green with adapters disabled.
+Real model (needs the 384 GB int4 snapshot and ~64 GB RAM):
 
+```bash
+./scripts/m7_smoke.sh                        # ~1 h: build, doctor, 1+10 steps, adapter-in-inference
+STEPS=100 RAM=44 caffeinate -dims ./scripts/m8_overfit.sh   # ~28 h: the M8 overfit + on/off eval
+```
+
+Knobs: `RAM` (GB budget; leave ~8 GB for macOS), `STEPS`, `LR`,
+`COLI_MODEL`, `ADAPTER_OUT`; `COLI_METAL=1` enables the Metal training path
+(off by default — see M9 numerics note in the commit log). A step prints one
+heartbeat line per micro-batch, `[mem]` telemetry every step, and checkpoints
+land every `--save-every` steps; interrupt with `kill -INT` and it saves at the
+step boundary and resumes exactly.
+
+### Performance (M4 Max, 64 GB, NVMe)
+
+One optimizer step (seq 128 × accum 4) ≈ **17 min**: ~65% expert disk I/O,
+~35% compute after the batched-backward work (a single fwd+bwd pass went from
+784 s to 239 s with bit-identical loss). Expert hit rate ~68% against a
+25 GB LRU cache. Training tok/s is honest but small (~0.07): v1 has no sample
+packing and streams ~1.2 TB of experts per step — M9 territory.
+
+### Status vs upstream
+
+This branch is based on pre-v1.0 upstream (`glm.c` era). Upstream has since
+refactored to `colibri.c` + modules; a port is in progress — tracked in the
+draft PR. Until then, `main` here tracks upstream and `qlora-train` is the
+working branch.
 
 ## See it running
 

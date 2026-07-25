@@ -43,10 +43,12 @@ for f in data/m8_eval/*.txt; do
   name="$(basename "$f" .txt)"
   P="$(cat "$f")"
   echo "----------------------------------------------------------"
+  # generation text is everything BEFORE the trailing "---" stats block
+  # (tail -3 used to grab the profile summary instead of the answer)
   echo ">> [$name] BASE (no adapter):"
-  SNAP="$MODEL" PROMPT="$P" NGEN=48 TEMP=0 ./glm 64 2>/dev/null | tail -3
+  SNAP="$MODEL" PROMPT="$P" NGEN=48 TEMP=0 ./glm 64 2>/dev/null | sed -n '1,/^---$/p' | grep -v '^\[t='
   echo ">> [$name] ADAPTER:"
-  ADAPTER="$OUT" SNAP="$MODEL" PROMPT="$P" NGEN=48 TEMP=0 ./glm 64 2>/dev/null | tail -3
+  ADAPTER="$OUT" SNAP="$MODEL" PROMPT="$P" NGEN=48 TEMP=0 ./glm 64 2>/dev/null | sed -n '1,/^---$/p' | grep -v '^\[t='
 done
 stamp "eval (all prompts, base+adapter)"
 echo "----------------------------------------------------------"

@@ -3,3 +3,5 @@ glm_tiny/
 olmoe_hf/
 olmoe_i4/
 train_state.bin
+coli_train
+adapters/
